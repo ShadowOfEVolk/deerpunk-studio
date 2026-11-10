@@ -115,8 +115,14 @@ pub struct StudioApp {
     pub pending: HashMap<u64, String>,
     pub collections: Vec<CollectionDescriptor>,
     pub lists: HashMap<String, Value>,
+    /// Per-collection time of the last `.list` fetch (lazy: only the active
+    /// Live view's collection is fetched).
+    pub last_fetch: HashMap<String, Instant>,
     pub selection: Option<Selection>,
     pub detail: Option<Value>,
+    /// Prefab → decoded icon texture (None = known missing/no icon), so each
+    /// prefab file is parsed and uploaded once per session.
+    pub prefab_icons: HashMap<String, Option<egui::TextureHandle>>,
     pub inspector_built: bool,
 
     // Run instance state.
@@ -164,6 +170,25 @@ pub struct StudioApp {
 }
 
 impl StudioApp {
+    /// Texture for a prefab's icon, decoded and uploaded once per prefab.
+    /// Missing prefab file / icon key / image yields None (cached) — never
+    /// an error surfaced to the UI.
+    pub fn prefab_icon(
+        &mut self,
+        ctx: &egui::Context,
+        prefab: &str,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.prefab_icons.get(prefab) {
+            return tex.clone();
+        }
+        let tex = self
+            .project
+            .as_ref()
+            .and_then(|p| load_prefab_icon(&p.gamedir, ctx, prefab));
+        self.prefab_icons.insert(prefab.to_string(), tex.clone());
+        tex
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, args: &[String]) -> Self {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -190,8 +215,10 @@ impl StudioApp {
             pending: HashMap::new(),
             collections: Vec::new(),
             lists: HashMap::new(),
+            last_fetch: HashMap::new(),
             selection: None,
             detail: None,
+            prefab_icons: HashMap::new(),
             inspector_built: false,
             profiles: Profiles::default(),
             active_profile: "dev".into(),
@@ -223,6 +250,16 @@ impl StudioApp {
             cvars_filter: String::new(),
             filters: HashMap::new(),
         };
+        // `--port <n>`: inspector port override (must land before any
+        // connect, including the one inside open_project).
+        let mut args: Vec<String> = args.to_vec();
+        if let Some(pos) = args.iter().position(|a| a == "--port") {
+            if let Some(p) = args.get(pos + 1) {
+                app.port = p.clone();
+            }
+            let end = (pos + 1).min(args.len() - 1);
+            args.drain(pos..=end);
+        }
         let path_arg = args.iter().find(|a| a.as_str() != "--run");
         if let Some(path) = path_arg {
             app.open_project(PathBuf::from(path));
@@ -316,6 +353,7 @@ impl StudioApp {
         self.pending.clear();
         self.collections.clear();
         self.lists.clear();
+        self.last_fetch.clear();
         self.inspector_built = false;
         self.net.cmd(NetCmd::Connect { host, port });
     }
@@ -366,27 +404,59 @@ impl StudioApp {
             .cmd(NetCmd::Send(protocol::request(id, method, params)));
     }
 
-    /// Refresh every list-mode collection and the active selection.
+    /// The collection whose Live view is active, if any.
+    fn active_collection(&self) -> Option<&str> {
+        match &self.active_view {
+            View::Live(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Fetch the active view's collection list (if it is a list-mode
+    /// collection) and the active selection's detail.
     pub fn request_refresh(&mut self) {
         if self.conn_state != ConnState::Connected {
             return;
         }
         self.last_refresh = Instant::now();
-        let ids: Vec<String> = self
+        let Some(id) = self.active_collection().map(str::to_string) else {
+            return;
+        };
+        if self
             .collections
             .iter()
-            .filter(|c| c.modes.contains(&protocol::CollectionMode::List))
-            .map(|c| c.id.clone())
-            .collect();
-        for id in ids {
+            .any(|c| c.id == id && c.modes.contains(&protocol::CollectionMode::List))
+        {
             self.rpc(&format!("{id}.list"), serde_json::json!({}));
+            self.last_fetch.insert(id.clone(), Instant::now());
         }
         if let Some(sel) = &self.selection {
-            let method = format!("{}.get", sel.col);
-            let index: Option<u64> = sel.index_str.parse().ok();
-            if let Some(index) = index {
-                self.rpc(&method, serde_json::json!({ "index": index }));
+            if sel.col == id {
+                let method = format!("{}.get", sel.col);
+                let index: Option<u64> = sel.index_str.parse().ok();
+                if let Some(index) = index {
+                    self.rpc(&method, serde_json::json!({ "index": index }));
+                }
             }
+        }
+    }
+
+    /// Lazy fetch for the active view: issue `.list` only when the data is
+    /// missing or (with a refresh interval) older than the interval. Called
+    /// on view switch and after initialize.
+    pub fn ensure_active_list(&mut self) {
+        if self.conn_state != ConnState::Connected {
+            return;
+        }
+        let Some(id) = self.active_collection().map(str::to_string) else {
+            return;
+        };
+        let stale = match self.last_fetch.get(&id) {
+            None => true,
+            Some(t) => self.refresh_ms > 0 && t.elapsed() >= Duration::from_millis(self.refresh_ms),
+        };
+        if stale {
+            self.request_refresh();
         }
     }
 
@@ -554,7 +624,7 @@ impl StudioApp {
                                 init.collections.len()
                             ));
                             self.inspector_built = true;
-                            self.request_refresh();
+                            self.ensure_active_list();
                         }
                         Err(e) => self.console_lines_push(format!("[ws] initialize parse: {e}")),
                     }
@@ -1030,6 +1100,7 @@ impl StudioApp {
         }
         if resp.clicked() {
             self.active_view = view;
+            self.ensure_active_list();
         }
         resp.on_hover_text(tooltip);
     }
@@ -1332,6 +1403,71 @@ fn glyph_box(ui: &mut egui::Ui, rect: egui::Rect, size: f32) {
 /// egui-side load can only ever succeed (async, cached, no per-frame IO).
 /// Missing file or undecodable bytes yield `None` and the identity block
 /// keeps its controller glyph.
+/// Decode a prefab's icon into a texture: `gamedir/prefabs/{prefab}.prefab`
+/// is a JSON `EntityDef` whose top level may carry `icon` (a gamedir-relative
+/// image path) and an optional `icon_color` tint (`[r, g, b]`, 0–255 or
+/// 0.0–1.0). Any failure (missing file, bad JSON, undecodable image) yields
+/// `None` — the row simply renders without an icon.
+fn load_prefab_icon(
+    gamedir: &std::path::Path,
+    ctx: &egui::Context,
+    prefab: &str,
+) -> Option<egui::TextureHandle> {
+    let path = gamedir.join("prefabs").join(format!("{prefab}.prefab"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let icon = value.get("icon").and_then(serde_json::Value::as_str)?;
+    let bytes = std::fs::read(gamedir.join(icon)).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let mut pixels: Vec<egui::Color32> = img
+        .pixels()
+        .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+        .collect();
+    if let Some(tint) = icon_color(&value) {
+        for c in &mut pixels {
+            *c = egui::Color32::from_rgba_unmultiplied(
+                (c.r() as u32 * tint[0] as u32 / 255) as u8,
+                (c.g() as u32 * tint[1] as u32 / 255) as u8,
+                (c.b() as u32 * tint[2] as u32 / 255) as u8,
+                c.a(),
+            );
+        }
+    }
+    let size = [img.width() as usize, img.height() as usize];
+    let source_size = egui::vec2(img.width() as f32, img.height() as f32);
+    let color_image = egui::ColorImage {
+        size,
+        pixels: std::mem::take(&mut pixels),
+        source_size,
+    };
+    Some(ctx.load_texture(
+        format!("prefab_icon_{prefab}"),
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Parse an optional `icon_color` JSON array into an 8-bit RGB tint.
+/// Values ≤ 1.0 are treated as floats (scaled ×255); anything larger as 0–255.
+fn icon_color(value: &serde_json::Value) -> Option<[u8; 3]> {
+    let arr = value
+        .get("icon_color")
+        .and_then(serde_json::Value::as_array)?;
+    if arr.len() != 3 {
+        return None;
+    }
+    let mut out = [0u8; 3];
+    for (i, v) in arr.iter().enumerate() {
+        let f = v.as_f64()?;
+        out[i] = if f <= 1.0 {
+            (f * 255.0).round().clamp(0.0, 255.0) as u8
+        } else {
+            f.round().clamp(0.0, 255.0) as u8
+        };
+    }
+    Some(out)
+}
+
 fn load_game_icon(gamedir: &std::path::Path, info: &GameInfo) -> Option<GameIcon> {
     let path = info.icon_path(gamedir)?;
     let bytes = std::fs::read(&path).ok()?;

@@ -882,6 +882,102 @@ fn selected_text_color(selected: bool) -> egui::Color32 {
     }
 }
 
+/// Entity list row: 16px prefab icon, prefab name as the display name, and
+/// a muted "x y z" position line under it. Icon missing / no prefab means
+/// no icon slot; the row degrades to a plain name line.
+/// Fallback glyph for entities whose prefab has no texture icon: a couple of
+/// well-known prefabs get a fitting glyph, everything else a cube.
+fn prefab_glyph(prefab: &str) -> &'static str {
+    match prefab {
+        "player" => ph::PERSON,
+        "item_drop" => ph::PACKAGE,
+        "main_menu" | "loading_screen" => ph::IMAGE,
+        _ => ph::CUBE,
+    }
+}
+
+fn entity_row(
+    ui: &mut egui::Ui,
+    app: &mut StudioApp,
+    selected: bool,
+    display_name: &str,
+    prefab: Option<&str>,
+    position: Option<&[f32; 3]>,
+) -> egui::Response {
+    let height = if position.is_some() { 30.0 } else { 20.0 };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let bg = if selected {
+        Some(theme::ACCENT)
+    } else if resp.hovered() {
+        Some(theme::HOVER)
+    } else {
+        None
+    };
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, 2.0, bg);
+    }
+    let text_color = selected_text_color(selected);
+    let dim_color = if selected {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+    } else {
+        theme::FAINT
+    };
+    let mut text_x = rect.left() + 6.0;
+    if let Some(prefab) = prefab {
+        let center = egui::pos2(text_x + 8.0, rect.center().y);
+        match app.prefab_icon(ui.ctx(), prefab) {
+            Some(tex) => {
+                let icon_rect = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+                ui.painter().image(
+                    tex.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    if selected {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::GRAY
+                    },
+                );
+            }
+            None => {
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    prefab_glyph(prefab),
+                    egui::FontId::proportional(12.0),
+                    dim_color,
+                );
+            }
+        }
+        text_x += 20.0;
+    }
+    let name_y = if position.is_some() {
+        rect.top() + 11.0
+    } else {
+        rect.center().y
+    };
+    ui.painter().text(
+        egui::pos2(text_x, name_y),
+        egui::Align2::LEFT_CENTER,
+        display_name,
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+    if let Some(p) = position {
+        ui.painter().text(
+            egui::pos2(text_x, rect.bottom() - 6.0),
+            egui::Align2::LEFT_CENTER,
+            protocol::format_position(p),
+            egui::FontId::monospace(10.0),
+            dim_color,
+        );
+    }
+    resp
+}
+
 // -------------------------------------------------------------- cvars view
 
 fn cvars_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
@@ -1045,25 +1141,43 @@ fn collection_sidebar(ui: &mut egui::Ui, app: &mut StudioApp, id: &str) {
                     .map(protocol::cell)
                     .unwrap_or_default();
                 let name = row.get("name").and_then(Value::as_str).unwrap_or("");
-                if !filter.is_empty() && !format!("{first} {name}").to_lowercase().contains(&filter)
+                let row_index = row.get(id_field.as_str()).map(protocol::cell);
+                let index_str = row_index.clone().unwrap_or_default();
+                let prefab = protocol::row_prefab(row);
+                let position = protocol::row_position(row);
+                if !filter.is_empty()
+                    && !format!("{first} {name} {}", prefab.as_deref().unwrap_or(""))
+                        .to_lowercase()
+                        .contains(&filter)
                 {
                     continue;
                 }
-                let row_index = row.get(id_field.as_str()).map(protocol::cell);
-                let index_str = row_index.clone().unwrap_or_default();
                 let selected = app
                     .selection
                     .as_ref()
                     .map(|s| s.col == id && s.index_str == index_str)
                     .unwrap_or(false);
-                if sidebar_row(
-                    ui,
-                    selected,
-                    egui::RichText::new(name_or_first(name, &first))
-                        .color(selected_text_color(selected)),
-                )
-                .clicked()
-                {
+                let display_name = prefab
+                    .clone()
+                    .unwrap_or_else(|| name_or_first(name, &first));
+                let resp = if prefab.is_some() || position.is_some() {
+                    entity_row(
+                        ui,
+                        app,
+                        selected,
+                        &display_name,
+                        prefab.as_deref(),
+                        position.as_ref(),
+                    )
+                } else {
+                    sidebar_row(
+                        ui,
+                        selected,
+                        egui::RichText::new(name_or_first(name, &first))
+                            .color(selected_text_color(selected)),
+                    )
+                };
+                if resp.clicked() {
                     if get_mode {
                         app.select(id.to_string(), index_str);
                     } else {
@@ -1094,6 +1208,9 @@ pub fn detail_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("●").size(10.0).color(theme::GREEN));
             ui.strong(theme::mono_text(&entity.name));
+            if let Some(prefab) = &entity.prefab {
+                ui.weak(format!("· {prefab}"));
+            }
             ui.weak(format!("#{}", entity.index));
             ui.weak(format!("{} components", entity.components.len()));
         });
@@ -1130,9 +1247,12 @@ fn component_card(ui: &mut egui::Ui, comp: &ComponentSnapshot) {
                 .corner_radius(8.0)
                 .inner_margin(8.0)
                 .show(ui, |ui| {
-                    ui.collapsing(theme::mono_text(slug), |ui| {
-                        json_view(ui, &format!("comp_{slug}"), 0, data);
-                    });
+                    egui::CollapsingHeader::new(theme::mono_text(slug))
+                        .id_salt(format!("comp_{slug}"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            json_view(ui, &format!("comp_{slug}"), 0, data);
+                        });
                 });
         }
     }

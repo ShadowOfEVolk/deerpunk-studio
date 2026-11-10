@@ -14,6 +14,7 @@ A native Rust desktop IDE (eframe/egui) for games built on the **deerpunk** engi
 - **Launch profiles & scenarios** — `.deerpunk/profiles.toml` (build profiles, cargo features, env) and `.deerpunk/scenarios.toml` (extra engine CLI args), switchable from the toolbar.
 - **Play button** — one-shot pipeline: build gamelibs → install them into the gamedir → build the engine → `cargo run … -- --gamedir … --svlib … --cllib …`, all output streamed to the console.
 - **Puffin profiler** — live flame-graph view fed by the game's `puffin_http` server (default `:8585`), auto-connecting.
+![deerpunk-studio — Puffin profiler](docs/screens/studio_profiler.jpg)
 - **MCP for AI agents** — optional `deerpunk-mcp` companion server exposing the engine inspector collections over streamable HTTP (see below).
 - Native macOS **File menu** (recent projects) via objc2.
 

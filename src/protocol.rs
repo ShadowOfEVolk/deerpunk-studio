@@ -67,8 +67,47 @@ pub enum ComponentSnapshot {
 pub struct EntityGetResult {
     pub index: u64,
     pub name: String,
+    /// Prefab classname from the network-entity component (optional).
+    #[serde(default)]
+    pub prefab: Option<String>,
     #[serde(default)]
     pub components: Vec<ComponentSnapshot>,
+}
+
+/// Optional `prefab` key on a list row (absent on older inspector hosts).
+pub fn row_prefab(row: &Value) -> Option<String> {
+    row.get("prefab")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Optional `position` key on a list row: `[x, y, z]` numbers.
+pub fn row_position(row: &Value) -> Option<[f32; 3]> {
+    let arr = row.get("position").and_then(Value::as_array)?;
+    if arr.len() != 3 {
+        return None;
+    }
+    let mut out = [0.0f32; 3];
+    for (i, v) in arr.iter().enumerate() {
+        out[i] = v.as_f64()? as f32;
+    }
+    Some(out)
+}
+
+/// Compact "x y z" rendering, rounding near-integers (`4.5 → 4`, `4.25 → 4.25`).
+pub fn format_position(p: &[f32; 3]) -> String {
+    p.iter()
+        .map(|v| {
+            let r = v.round();
+            if (*v - r).abs() < 0.001 {
+                format!("{r}")
+            } else {
+                format!("{v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Outgoing JSON-RPC 2.0 request/notification.
@@ -207,6 +246,37 @@ mod tests {
             init.collections[0].modes,
             vec![CollectionMode::List, CollectionMode::Get]
         );
+    }
+
+    #[test]
+    fn entity_row_optional_keys() {
+        let new_row =
+            json!({"index": 1, "name": "player", "prefab": "player", "position": [1.0, 2.5, -3.0]});
+        assert_eq!(row_prefab(&new_row).as_deref(), Some("player"));
+        assert_eq!(row_position(&new_row), Some([1.0, 2.5, -3.0]));
+        assert_eq!(format_position(&[1.0, 2.5, -3.0]), "1 2.5 -3");
+
+        let old_row = json!({"index": 2, "name": "mob"});
+        assert_eq!(row_prefab(&old_row), None);
+        assert_eq!(row_position(&old_row), None);
+
+        let bad = json!({"index": 3, "name": "x", "position": [1.0, 2.0]});
+        assert_eq!(row_position(&bad), None);
+        let empty_prefab = json!({"index": 4, "name": "x", "prefab": ""});
+        assert_eq!(row_prefab(&empty_prefab), None);
+    }
+
+    #[test]
+    fn entity_get_result_prefab_optional() {
+        let with: EntityGetResult = serde_json::from_value(json!({
+            "index": 1, "name": "p", "prefab": "player",
+            "components": [{"slug": "T", "data": {}}]
+        }))
+        .unwrap();
+        assert_eq!(with.prefab.as_deref(), Some("player"));
+        let without: EntityGetResult =
+            serde_json::from_value(json!({"index": 2, "name": "q", "components": []})).unwrap();
+        assert_eq!(without.prefab, None);
     }
 
     #[test]
