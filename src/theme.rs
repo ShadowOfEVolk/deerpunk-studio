@@ -36,6 +36,9 @@ pub const RED: Color32 = c("#d4483d");
 // Tabs (workspace strip + dock tab bars).
 pub const TAB_INACTIVE: Color32 = c("#9a9a9a");
 
+/// Toolbar strip tint while an instance is building/running.
+pub const BAR_ACTIVE: Color32 = c("#2b3950");
+
 // JsonView syntax colors (desaturated to fit the neutral surface).
 pub const J_KEY: Color32 = c("#9db9dd");
 pub const J_STRING: Color32 = c("#a5d6a7");

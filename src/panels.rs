@@ -4,10 +4,12 @@
 use eframe::egui;
 use serde_json::Value;
 
+use crate::ansi::{self, Stream};
 use crate::app::{StudioApp, Tab};
 use crate::assets::AssetKind;
 use crate::net::ConnState;
 use crate::protocol::{self, ComponentSnapshot};
+use crate::runner::{RunState, StepState};
 use crate::theme;
 
 pub fn render(ui: &mut egui::Ui, tab: &Tab, app: &mut StudioApp) {
@@ -52,6 +54,14 @@ fn project_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
                 if project.gamedir_valid() { "(ok)" } else { "(missing)" }
             ),
         );
+        kv_row(ui, "engine.path", &project.engine_dir.display().to_string());
+        for lib in &project.gamelibs {
+            kv_row(
+                ui,
+                "launch.gamelibs",
+                &format!("{} → {} ({})", lib.package, lib.artifact, lib.slot),
+            );
+        }
         if project.launch_commands.is_empty() {
             kv_row(ui, "launch.commands", "[]");
         } else {
@@ -278,12 +288,95 @@ fn raw_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
 }
 
 fn console_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
-    egui::ScrollArea::vertical().auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
-        let lines = app.console_lines.clone();
-        for line in lines {
-            ui.monospace(line);
+    // Pre_run step strip.
+    if !app.steps.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for step in &app.steps {
+                let (glyph, color) = match &step.state {
+                    StepState::Pending => ("…", theme::FAINT),
+                    StepState::Running => ("▶", theme::ACCENT_TEXT),
+                    StepState::Ok => ("✓", theme::GREEN),
+                    StepState::Failed(_) => ("✗", theme::RED),
+                };
+                ui.label(egui::RichText::new(glyph).color(color));
+                ui.label(theme::small(&step.name));
+                if let StepState::Failed(e) = &step.state {
+                    ui.label(egui::RichText::new(e.clone()).small().color(theme::RED));
+                }
+                ui.label(theme::small("·"));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(theme::small("clear")).frame(false))
+                    .clicked()
+                {
+                    app.console = Stream::new(5000);
+                }
+            });
+        });
+        ui.separator();
+    }
+
+    // Terminal stream (PTY output, ANSI colors applied).
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let pending = !app.console.pending().is_empty();
+    let total = app.console.lines.len() + usize::from(pending);
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .stick_to_bottom(true)
+        .show_rows(ui, row_h, total.max(1), |ui, range| {
+            for i in range {
+                let line = if i < app.console.lines.len() {
+                    &app.console.lines[i]
+                } else if pending {
+                    app.console.pending()
+                } else {
+                    continue;
+                };
+                render_console_line(ui, line);
+            }
+        });
+
+    // Console command input (engine reads lines from stdin).
+    ui.separator();
+    ui.horizontal(|ui| {
+        let running = app.run_state == RunState::Running;
+        ui.monospace(">");
+        let hint = if running { "console command…" } else { "engine not running" };
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut app.input)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if enter && running && !app.input.trim().is_empty() {
+            app.runner.input(app.input.trim().to_string());
+            app.input.clear();
         }
     });
+}
+
+fn render_console_line(ui: &mut egui::Ui, line: &[ansi::Span]) {
+    let mut job = egui::text::LayoutJob::default();
+    for span in line {
+        let mut color = span
+            .style
+            .color
+            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+            .unwrap_or(theme::TEXT);
+        if span.style.dim {
+            color = egui::Color32::from_rgb(color.r() * 6 / 10, color.g() * 6 / 10, color.b() * 6 / 10);
+        }
+        job.append(
+            &span.text,
+            0.0,
+            egui::TextFormat::simple(egui::FontId::monospace(13.0), color),
+        );
+    }
+    if job.is_empty() {
+        job.append(" ", 0.0, egui::TextFormat::simple(egui::FontId::monospace(13.0), theme::TEXT));
+    }
+    ui.add(egui::Label::new(job));
 }
 
 // -------------------------------------------------------------- live panels

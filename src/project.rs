@@ -26,9 +26,24 @@ pub struct Project {
     pub name: String,
     /// `[engine].gamedir` resolved to an absolute path (root-joined).
     pub gamedir: PathBuf,
+    /// `[engine].path` — engine repo directory, default `../deerpunk`.
+    pub engine_dir: PathBuf,
+    /// `[launch].gamelibs` — cdylib crates to build and install.
+    pub gamelibs: Vec<GameLib>,
     pub launch_commands: Vec<String>,
     /// Unknown `key = value` pairs (section-prefixed), in file order.
     pub extras: Vec<(String, String)>,
+}
+
+/// One gamelib built and installed into the gamedir.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GameLib {
+    /// Cargo package name, e.g. `ohmyblock-server`.
+    pub package: String,
+    /// cdylib artifact base name, e.g. `ohmyblock_amd64`.
+    pub artifact: String,
+    /// Install slot and CLI mapping: `server` | `client`.
+    pub slot: String,
 }
 
 impl Project {
@@ -54,6 +69,30 @@ impl Project {
             .unwrap_or("./gamedir")
             .to_string();
         let gamedir = resolve_relative(root, &gamedir_raw);
+
+        let engine_raw = table
+            .get("engine")
+            .and_then(|e| e.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("../deerpunk")
+            .to_string();
+        let engine_dir = resolve_relative(root, &engine_raw);
+
+        let mut gamelibs = Vec::new();
+        if let Some(items) = table
+            .get("launch")
+            .and_then(|l| l.get("gamelibs"))
+            .and_then(|v| v.as_array())
+        {
+            for item in items {
+                match item.clone().try_into::<GameLib>() {
+                    Ok(lib) => gamelibs.push(lib),
+                    Err(_) => {
+                        return Err("deerpunk.toml: bad [launch].gamelibs entry (need package, artifact, slot)".into())
+                    }
+                }
+            }
+        }
 
         let launch_commands = table
             .get("launch")
@@ -91,6 +130,8 @@ impl Project {
             raw,
             name,
             gamedir,
+            engine_dir,
+            gamelibs,
             launch_commands,
             extras,
         })
@@ -155,7 +196,32 @@ mod tests {
         let dir = write_root("sparse", "[project]\nname = \"x\"\n");
         let p = Project::load(&dir).unwrap();
         assert_eq!(p.gamedir, dir.join("./gamedir"));
+        assert_eq!(p.engine_dir, dir.join("../deerpunk"));
+        assert!(p.gamelibs.is_empty());
         assert!(p.launch_commands.is_empty());
+    }
+
+    #[test]
+    fn parses_gamelibs_and_engine_path() {
+        let dir = write_root(
+            "gamelibs",
+            "[engine]\ngamedir = \"./gamedir\"\npath = \"../deerpunk\"\n\n[launch]\n[[launch.gamelibs]]\npackage = \"ohmyblock-server\"\nartifact = \"ohmyblock_amd64\"\nslot = \"server\"\n\n[[launch.gamelibs]]\npackage = \"ohmyblock-client\"\nartifact = \"client_amd64\"\nslot = \"client\"\n",
+        );
+        let p = Project::load(&dir).unwrap();
+        assert_eq!(p.engine_dir, dir.join("../deerpunk"));
+        assert_eq!(p.gamelibs.len(), 2);
+        assert_eq!(p.gamelibs[0].package, "ohmyblock-server");
+        assert_eq!(p.gamelibs[0].slot, "server");
+        assert_eq!(p.gamelibs[1].artifact, "client_amd64");
+    }
+
+    #[test]
+    fn bad_gamelib_entry_is_error() {
+        let dir = write_root(
+            "badgamelib",
+            "[launch]\n[[launch.gamelibs]]\npackage = \"x\"\n",
+        );
+        assert!(Project::load(&dir).is_err());
     }
 
     #[test]

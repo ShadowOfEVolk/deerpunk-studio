@@ -10,13 +10,16 @@ use eframe::egui;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer, TabStyle, TabBarStyle, Style as DockStyle};
 use serde_json::Value;
 
+use crate::ansi::Stream;
 use crate::assets::{self, AssetKind, ScanResult};
 use crate::config::StudioConfig;
 use crate::gameinfo::GameInfo;
 use crate::net::{ConnState, NetClient, NetCmd, NetEvent};
 use crate::panels;
+use crate::profiles::Profiles;
 use crate::project::Project;
 use crate::protocol::{self, CollectionDescriptor};
+use crate::runner::{self, Event as RunEvent, Runner, RunState, Step, StepState};
 use crate::theme;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,6 +75,15 @@ pub struct StudioApp {
     pub console_lines: Vec<String>,
     pub inspector_built: bool,
 
+    // Run instance state.
+    pub profiles: Profiles,
+    pub active_profile: String,
+    pub runner: Runner,
+    pub run_state: RunState,
+    pub steps: Vec<Step>,
+    pub console: Stream,
+    pub input: String,
+
     // Workspaces + per-panel UI state.
     pub workspace: Workspace,
     pub files_dock: DockState<Tab>,
@@ -112,6 +124,13 @@ impl StudioApp {
             detail: None,
             console_lines: Vec::new(),
             inspector_built: false,
+            profiles: Profiles::default(),
+            active_profile: "dev".into(),
+            runner: Runner::new(),
+            run_state: RunState::Idle,
+            steps: Vec::new(),
+            console: Stream::new(5000),
+            input: String::new(),
             workspace: Workspace::Files,
             files_dock: Self::build_files_dock(),
             inspector_dock: Self::build_inspector_dock(&[]),
@@ -121,7 +140,8 @@ impl StudioApp {
             cvars_filter: String::new(),
             filters: HashMap::new(),
         };
-        if let Some(path) = args.first() {
+        let path_arg = args.iter().find(|a| a.as_str() != "--run");
+        if let Some(path) = path_arg {
             app.open_project(PathBuf::from(path));
         } else {
             // Launched from a game folder with no args: use the current dir.
@@ -131,6 +151,10 @@ impl StudioApp {
             } else if let Some(last) = app.cfg.last_project.clone() {
                 app.open_project(PathBuf::from(last));
             }
+        }
+        // `--run`: start the instance immediately (build + engine launch).
+        if args.iter().any(|a| a == "--run") {
+            app.run_instance();
         }
         app
     }
@@ -187,7 +211,15 @@ impl StudioApp {
                 self.cfg.record_open(&root.to_string_lossy());
                 self.cfg.save();
                 self.project = Some(project);
-                self.console_lines.clear();
+                self.profiles = Profiles::load(&root);
+                self.active_profile = self
+                    .profiles
+                    .order
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "dev".into());
+                self.console = Stream::new(5000);
+                self.steps.clear();
                 self.connect();
             }
             Err(e) => {
@@ -272,6 +304,52 @@ impl StudioApp {
     pub fn select(&mut self, col: String, index_str: String) {
         self.selection = Some(Selection { col, index_str });
         self.request_refresh();
+    }
+
+    /// Launch the pre_run pipeline + engine instance with the active profile.
+    pub fn run_instance(&mut self) {
+        if self.run_state != RunState::Idle {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let Some(profile) = self.profiles.get(&self.active_profile).cloned() else {
+            self.error = Some(format!("no run profile `{}`", self.active_profile));
+            return;
+        };
+        self.console = Stream::new(5000);
+        self.steps = runner::STEP_NAMES
+            .iter()
+            .map(|n| Step { name: (*n).to_string(), state: StepState::Pending })
+            .collect();
+        self.runner.start(runner::InstancePlan {
+            project_root: project.root.clone(),
+            gamedir: project.gamedir.clone(),
+            engine_dir: project.engine_dir.clone(),
+            profile,
+            gamelibs: project.gamelibs.clone(),
+        });
+    }
+
+    pub fn stop_instance(&mut self) {
+        self.runner.stop();
+    }
+
+    fn poll_runner(&mut self) {
+        for ev in self.runner.poll() {
+            match ev {
+                RunEvent::Console(bytes) => self.console.feed(&bytes),
+                RunEvent::State(state) => self.run_state = state,
+                RunEvent::Step(idx, state) => {
+                    if let Some(step) = self.steps.get_mut(idx) {
+                        step.state = state;
+                    }
+                }
+                RunEvent::Note(text) => self.console.feed(format!("{text}\n").as_bytes()),
+                RunEvent::Exited(_) => {}
+            }
+        }
     }
 
     fn poll_net(&mut self) {
@@ -376,8 +454,10 @@ impl StudioApp {
     // ------------------------------------------------------------- layout
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let active = self.run_state != RunState::Idle;
+        let fill = if active { theme::BAR_ACTIVE } else { theme::HEADER };
         egui::Frame::new()
-            .fill(theme::HEADER)
+            .fill(fill)
             .inner_margin(egui::Margin::symmetric(6, 3))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -388,6 +468,33 @@ impl StudioApp {
                         ui.weak(&project.name);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right-to-left order: Run/Stop, then profile, then file
+                        // actions — so the profile dropdown sits left of Run.
+                        if self.run_state == RunState::Idle {
+                            if ui.button("▶ Run").clicked() {
+                                self.run_instance();
+                            }
+                        } else {
+                            if ui.button("■ Stop").clicked() {
+                                self.stop_instance();
+                            }
+                            ui.label(theme::small(run_state_label(&self.run_state)));
+                        }
+                        let profile_label = self
+                            .profiles
+                            .get(&self.active_profile)
+                            .map(|p| p.label.clone())
+                            .unwrap_or_else(|| self.active_profile.clone());
+                        egui::ComboBox::from_id_salt("run_profile")
+                            .selected_text(profile_label)
+                            .show_ui(ui, |ui| {
+                                for id in self.profiles.order.clone() {
+                                    let Some(p) = self.profiles.get(&id) else { continue };
+                                    if ui.selectable_label(id == self.active_profile, &p.label).clicked() {
+                                        self.active_profile = id;
+                                    }
+                                }
+                            });
                         if ui.button("Open…").clicked() {
                             self.pick_folder();
                         }
@@ -564,6 +671,7 @@ impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_scan();
         self.poll_net();
+        self.poll_runner();
         self.handle_dropped_files(ui);
 
         self.top_bar(ui);
@@ -695,6 +803,16 @@ impl<'a> TabViewer for AppTabViewer<'a> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         panels::render(ui, tab, self.app);
+    }
+}
+
+fn run_state_label(state: &RunState) -> String {
+    match state {
+        RunState::Idle => "idle".into(),
+        RunState::Building => "building…".into(),
+        RunState::Running => "running".into(),
+        RunState::Stopping => "stopping…".into(),
+        RunState::Failed(e) => format!("failed: {e}"),
     }
 }
 

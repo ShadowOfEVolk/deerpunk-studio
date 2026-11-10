@@ -921,6 +921,7 @@ dependencies = [
  "egui_dock",
  "egui_extras",
  "image",
+ "libc",
  "rfd",
  "serde",
  "serde_json",
