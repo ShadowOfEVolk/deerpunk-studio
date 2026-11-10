@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/deerpunk-mcp"]
+members = [".", "crates/deerpunk-mcp", "crates/studio-gpui"]
 
 [package]
 name = "deerpunk-studio"
@@ -8,24 +8,24 @@ edition = "2024"
 
 [dependencies]
 dirs = "7.0.0"
-eframe = "0.36"
-egui-phosphor = "0.14"
-egui_extras = { version = "0.36", features = ["file", "image", "svg"] }
 image = "0.25.10"
 libc = "0.2.191"
 puffin_http = "0.17"
-puffin_egui = { path = "third_party/puffin_egui" }
-rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+deerpunk-engine-common = { path = "../deerpunk/crates/engine-common" }
+deerpunk-ui = { path = "../deerpunk/crates/engine-ui" }
 toml = "1.2.1"
 tungstenite = "0.30.0"
 walkdir = "2.5.0"
 
-[dev-dependencies]
-egui_kittest = { version = "0.36", features = ["snapshot", "wgpu", "eframe"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.5.2", features = ["relax-sign-encoding"] }
-objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }
-objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString"] }
+# Optimize GPUI framework deps in dev builds (docs/installation recommendation).
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
