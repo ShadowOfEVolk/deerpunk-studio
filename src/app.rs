@@ -961,7 +961,7 @@ impl StudioApp {
                 }
             }
 
-            // Bottom: console toggle.
+            // Bottom: MCP launcher above the console toggle.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 let toggle = ph::TERMINAL_WINDOW;
                 let btn = egui::Button::new(
@@ -973,6 +973,22 @@ impl StudioApp {
                 .min_size(egui::vec2(36.0, 24.0));
                 if ui.add(btn).clicked() {
                     self.console_open = !self.console_open;
+                }
+                ui.add_space(4.0);
+                let mcp_up = self.mcp.is_running();
+                let plug = egui::Button::new(
+                    egui::RichText::new(ph::PLUG)
+                        .color(if mcp_up { theme::GREEN } else { theme::MUTED })
+                        .size(14.0),
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .min_size(egui::vec2(36.0, 24.0));
+                if ui
+                    .add(plug)
+                    .on_hover_text("MCP server for AI agents")
+                    .clicked()
+                {
+                    self.mcp_modal_open = true;
                 }
             });
         });
@@ -1024,21 +1040,6 @@ impl StudioApp {
             conn_badge(ui, &self.conn_state);
             if matches!(self.conn_state, ConnState::Connected | ConnState::Error(_)) {
                 ui.label(theme::small(format!("{}:{}", self.host, self.port)));
-            }
-            let mcp_up = self.mcp.is_running();
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new(ph::PLUG).small().color(if mcp_up {
-                        theme::GREEN
-                    } else {
-                        theme::MUTED
-                    }))
-                    .frame(false),
-                )
-                .on_hover_text("MCP server for AI agents")
-                .clicked()
-            {
-                self.mcp_modal_open = true;
             }
             if ui
                 .add(egui::Button::new(theme::small("connect")).frame(false))

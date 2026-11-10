@@ -51,7 +51,7 @@ The optional `deerpunk-mcp` crate (`crates/deerpunk-mcp`) ships an MCP server bi
 - `GET /status` — server/engine status probe
 - Tools: `inspector_status`, `collections_list`, `collection_items`
 
-The studio status bar shows an MCP icon; clicking it opens a modal with the server status, the available tools, the machine's LAN IP, and instructions for connecting agents.
+The studio's left rail shows an MCP icon; clicking it opens a modal with the server status, the available tools, the machine's LAN IP, and instructions for connecting agents.
 
 Generic MCP client config (point `url` at your machine's LAN address so agents on other devices can reach it):
 

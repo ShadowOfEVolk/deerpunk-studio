@@ -12,6 +12,13 @@ use serde::Deserialize;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 const STATUS_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+/// Adopt-probe timeout: localhost refusal is instant, 250 ms is generous.
+const ADOPT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Cooldown between auto-respawn attempts after a failed spawn or dead child.
+const RESPAWN_COOLDOWN: Duration = Duration::from_secs(10);
+/// Consecutive failed `/status` polls before we stop trusting an adopted
+/// external server and allow spawning our own child again.
+const EXTERNAL_MAX_FAILURES: u32 = 4;
 
 /// Subset of the binary's `GET /status` document (see crates/deerpunk-mcp).
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +53,13 @@ pub struct McpTool {
 pub struct McpManager {
     port: u16,
     child: Option<Child>,
+    /// True when a valid `deerpunk-mcp` was already listening on the port
+    /// (started outside this process); we adopt it instead of spawning.
+    external: bool,
+    /// Consecutive failed `/status` polls while `external` is set.
+    external_failures: u32,
+    /// Earliest instant at which the next auto-respawn attempt is allowed.
+    next_spawn_at: Option<Instant>,
     status_rx: Option<Receiver<Result<String, String>>>,
     status_req_at: Option<Instant>,
     /// Last successful `/status` document.
@@ -59,6 +73,9 @@ impl McpManager {
         Self {
             port,
             child: None,
+            external: false,
+            external_failures: 0,
+            next_spawn_at: None,
             status_rx: None,
             status_req_at: None,
             status: None,
@@ -71,21 +88,52 @@ impl McpManager {
     }
 
     /// Spawn the server if it is not running yet (auto-start on app launch).
+    /// A valid external `deerpunk-mcp` already on the port is adopted instead.
     pub fn ensure_started(&mut self, inspector_addr: &str) {
         if self.is_running() {
             return;
         }
+        // Back off auto-respawn after a dead child / failed spawn so a port
+        // held by garbage cannot turn into an endless spawn loop.
+        if let Some(at) = self.next_spawn_at {
+            if Instant::now() < at {
+                return;
+            }
+        }
+        // Adopt an externally started server if it answers /status.
+        match probe_status(self.port) {
+            Ok(status) => {
+                self.external = true;
+                self.external_failures = 0;
+                self.status = Some(status);
+                self.status_err = None;
+                self.next_spawn_at = None;
+                return;
+            }
+            Err(_) => {} // nothing valid to adopt; try to spawn
+        }
         match self.spawn(inspector_addr) {
-            Ok(()) => self.status_err = None,
-            Err(e) => self.status_err = Some(e),
+            Ok(()) => {
+                self.status_err = None;
+                self.next_spawn_at = None;
+            }
+            Err(e) => {
+                self.status_err = Some(e);
+                self.next_spawn_at = Some(Instant::now() + RESPAWN_COOLDOWN);
+            }
         }
     }
 
     pub fn is_running(&mut self) -> bool {
+        if self.external {
+            return true;
+        }
         match self.child.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(Some(_)) => {
                     self.child = None;
+                    // The child died on its own (e.g. bind failure): back off.
+                    self.next_spawn_at = Some(Instant::now() + RESPAWN_COOLDOWN);
                     false
                 }
                 Ok(None) => true,
@@ -103,6 +151,9 @@ impl McpManager {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.external = false;
+        self.external_failures = 0;
+        self.next_spawn_at = None;
         self.status = None;
         self.status_err = None;
     }
@@ -152,7 +203,7 @@ impl McpManager {
         std::thread::Builder::new()
             .name("mcp-status".into())
             .spawn(move || {
-                let _ = tx.send(http_get_json("127.0.0.1", port, "/status"));
+                let _ = tx.send(http_get_json("127.0.0.1", port, "/status", STATUS_TIMEOUT));
             })
             .ok();
     }
@@ -167,16 +218,48 @@ impl McpManager {
                 Ok(status) => {
                     self.status = Some(status);
                     self.status_err = None;
+                    if self.external {
+                        self.external_failures = 0;
+                    }
                 }
-                Err(e) => self.status_err = Some(format!("parse /status: {e}")),
+                Err(e) => self.note_status_failure(format!("parse /status: {e}")),
             },
-            Ok(Err(e)) => self.status_err = Some(e),
+            Ok(Err(e)) => self.note_status_failure(e),
             Err(mpsc::TryRecvError::Empty) => self.status_rx = Some(rx), // still in flight
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.status_err = Some("status thread died".into())
+                self.note_status_failure("status thread died".into())
             }
         }
     }
+
+    /// Record a failed `/status` poll; too many consecutive failures while an
+    /// external server is adopted means it went away, so allow respawning.
+    fn note_status_failure(&mut self, err: String) {
+        self.status_err = Some(err);
+        if self.external {
+            self.external_failures += 1;
+            if self.external_failures >= EXTERNAL_MAX_FAILURES {
+                self.external = false;
+                self.external_failures = 0;
+            }
+        }
+    }
+}
+
+impl Drop for McpManager {
+    fn drop(&mut self) {
+        // Never orphan the child / the port when the studio exits.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// One-shot blocking `/status` probe used to adopt an external server.
+fn probe_status(port: u16) -> Result<McpStatus, String> {
+    let body = http_get_json("127.0.0.1", port, "/status", ADOPT_PROBE_TIMEOUT)?;
+    serde_json::from_str::<McpStatus>(&body).map_err(|e| format!("parse /status: {e}"))
 }
 
 /// Resolve the server binary: env override first, then next to our own exe.
@@ -195,11 +278,11 @@ fn binary_path() -> Result<std::path::PathBuf, String> {
 
 /// Minimal HTTP/1.0 GET returning the body (JSON text). HTTP/1.0 avoids
 /// chunked transfer-encoding, so `read_to_end` sees the whole document.
-fn http_get_json(host: &str, port: u16, path: &str) -> Result<String, String> {
+fn http_get_json(host: &str, port: u16, path: &str, timeout: Duration) -> Result<String, String> {
     let mut stream =
         TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
     stream
-        .set_read_timeout(Some(STATUS_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| format!("read timeout: {e}"))?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n");
     stream
