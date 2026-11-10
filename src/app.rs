@@ -590,7 +590,7 @@ impl StudioApp {
         if active {
             let mut stripe = resp.rect;
             stripe.set_width(3.0);
-            stripe = stripe.translate(egui::vec2(-6.0, 0.0));
+            stripe = stripe.translate(egui::vec2(-4.0, 0.0));
             ui.painter().rect_filled(stripe, 1.0, theme::ACCENT);
         }
         if resp.clicked() {
