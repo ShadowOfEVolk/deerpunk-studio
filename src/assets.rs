@@ -98,10 +98,17 @@ pub fn scan_gamedir(gamedir: &Path) -> ScanResult {
         let pack = rel
             .components()
             .nth(1)
-            .filter(|_| rel.components().next().map(|c| c.as_os_str()) == Some("datapacks".as_ref()))
+            .filter(|_| {
+                rel.components().next().map(|c| c.as_os_str()) == Some("datapacks".as_ref())
+            })
             .and_then(|c| c.as_os_str().to_str())
             .map(str::to_string);
-        out.entries.push(AssetEntry { rel, kind, size, pack });
+        out.entries.push(AssetEntry {
+            rel,
+            kind,
+            size,
+            pack,
+        });
     }
     out.entries.sort_by(|a, b| a.rel.cmp(&b.rel));
     out
@@ -270,22 +277,36 @@ mod tests {
             ("maps/test/level.json", AssetKind::Map),
             ("maps/test/regions/r.0.0.ohr", AssetKind::MapRegion),
             ("datapacks/ohmyblock/pack.toml", AssetKind::DataPack),
-            ("datapacks/ohmyblock/blocks/01_stone.json", AssetKind::DataPack),
+            (
+                "datapacks/ohmyblock/blocks/01_stone.json",
+                AssetKind::DataPack,
+            ),
             ("datapacks/ohmyblock/blocks/stone.png", AssetKind::Texture),
-            ("datapacks/ohmyblock/sounds/ambient/cave.ogg", AssetKind::Sound),
+            (
+                "datapacks/ohmyblock/sounds/ambient/cave.ogg",
+                AssetKind::Sound,
+            ),
             ("ui/fonts/main.ttf", AssetKind::Font),
             ("logs/latest.log", AssetKind::Log),
         ];
         for (rel, kind) in cases {
             assert_eq!(find(&res, rel).kind, kind, "kind mismatch for {rel}");
         }
-        assert_eq!(find(&res, "dlls/client/client.dylib").kind, AssetKind::Binary);
+        assert_eq!(
+            find(&res, "dlls/client/client.dylib").kind,
+            AssetKind::Binary
+        );
         assert_eq!(find(&res, "ui/styles/main.json").kind, AssetKind::Ui);
         assert_eq!(find(&res, "readme.md").kind, AssetKind::Doc);
         // cache/ skipped entirely.
         assert!(res.entries.iter().all(|e| !e.rel.starts_with("cache")));
         // datapack tag follows the pack folder.
-        assert_eq!(find(&res, "datapacks/ohmyblock/blocks/01_stone.json").pack.as_deref(), Some("ohmyblock"));
+        assert_eq!(
+            find(&res, "datapacks/ohmyblock/blocks/01_stone.json")
+                .pack
+                .as_deref(),
+            Some("ohmyblock")
+        );
         assert_eq!(find(&res, "textures/blocks/stone.png").pack, None);
         let _ = std::fs::remove_dir_all(&gamedir);
     }

@@ -87,9 +87,10 @@ impl Project {
             for item in items {
                 match item.clone().try_into::<GameLib>() {
                     Ok(lib) => gamelibs.push(lib),
-                    Err(_) => {
-                        return Err("deerpunk.toml: bad [launch].gamelibs entry (need package, artifact, slot)".into())
-                    }
+                    Err(_) => return Err(
+                        "deerpunk.toml: bad [launch].gamelibs entry (need package, artifact, slot)"
+                            .into(),
+                    ),
                 }
             }
         }

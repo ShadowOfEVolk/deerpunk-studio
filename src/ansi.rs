@@ -13,7 +13,11 @@ pub struct TextStyle {
 
 impl TextStyle {
     const fn plain() -> Self {
-        Self { color: None, bold: false, dim: false }
+        Self {
+            color: None,
+            bold: false,
+            dim: false,
+        }
     }
 
     fn same(&self, other: &TextStyle) -> bool {
@@ -202,7 +206,10 @@ impl Stream {
                 return;
             }
         }
-        self.cur.push(Span { text: text.to_string(), style: self.style });
+        self.cur.push(Span {
+            text: text.to_string(),
+            style: self.style,
+        });
     }
 
     fn commit_line(&mut self) {

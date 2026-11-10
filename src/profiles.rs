@@ -57,9 +57,16 @@ impl Profiles {
             return Self::default_profiles();
         };
 
-        let mut out = Profiles { order: Vec::new(), map: BTreeMap::new() };
+        let mut out = Profiles {
+            order: Vec::new(),
+            map: BTreeMap::new(),
+        };
         for (id, value) in table {
-            let label = value.get("label").and_then(|v| v.as_str()).unwrap_or(id).to_string();
+            let label = value
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
             let engine_profile = value
                 .get("engine_profile")
                 .and_then(|v| v.as_str())
@@ -83,7 +90,14 @@ impl Profiles {
             out.order.push(id.clone());
             out.map.insert(
                 id.clone(),
-                RunProfile { label, engine_profile, game_profile, engine_features, game_features, env },
+                RunProfile {
+                    label,
+                    engine_profile,
+                    game_profile,
+                    engine_features,
+                    game_features,
+                    env,
+                },
             );
         }
         if out.map.is_empty() {

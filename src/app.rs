@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -18,7 +19,7 @@ use crate::panels;
 use crate::profiles::Profiles;
 use crate::project::Project;
 use crate::protocol::{self, CollectionDescriptor};
-use crate::runner::{self, Event as RunEvent, Runner, RunState, Step, StepState};
+use crate::runner::{self, Event as RunEvent, RunState, Runner, Step, StepState};
 use crate::theme;
 use egui_phosphor::variants::regular as ph;
 
@@ -57,6 +58,17 @@ pub struct Scenario {
     pub label: String,
     /// Extra engine args, e.g. ["--inspector-port", "9000"].
     pub args: Vec<String>,
+}
+
+/// Game icon bytes, read and decode-checked once per project. Fed to egui
+/// as a `bytes://` source because the `file://` loader is not compiled in
+/// (`egui_extras` runs without its `file` feature).
+#[derive(Clone)]
+pub struct GameIcon {
+    /// Stable per-icon-path uri, so egui's image cache never mixes icons.
+    uri: String,
+    /// Raw icon file bytes (known decodable).
+    bytes: Arc<[u8]>,
 }
 
 pub const REFRESH_OPTIONS: [u64; 5] = [0, 200, 250, 500, 1000];
@@ -118,6 +130,8 @@ pub struct StudioApp {
 
     // Game info modal (top bar icon click).
     pub show_gameinfo_modal: bool,
+    /// The project's game icon, loaded eagerly (see [`GameIcon`]).
+    pub game_icon: Option<GameIcon>,
 
     // Per-view UI state.
     pub assets_filter: String,
@@ -175,6 +189,7 @@ impl StudioApp {
             }],
             active_scenario: "default".into(),
             show_gameinfo_modal: false,
+            game_icon: None,
             assets_filter: String::new(),
             assets_kind: None,
             textures_filter: String::new(),
@@ -207,7 +222,9 @@ impl StudioApp {
         match Project::load(&root) {
             Ok(project) => {
                 self.error = None;
-                self.gameinfo = Some(GameInfo::from_gamedir(&project.gamedir));
+                let gameinfo = GameInfo::from_gamedir(&project.gamedir);
+                self.game_icon = load_game_icon(&project.gamedir, &gameinfo);
+                self.gameinfo = Some(gameinfo);
                 self.scan = None;
                 let gamedir = project.gamedir.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -289,7 +306,8 @@ impl StudioApp {
         let id = self.next_rpc_id;
         self.next_rpc_id += 1;
         self.pending.insert(id, method.to_string());
-        self.net.cmd(NetCmd::Send(protocol::request(id, method, params)));
+        self.net
+            .cmd(NetCmd::Send(protocol::request(id, method, params)));
     }
 
     /// Refresh every list-mode collection and the active selection.
@@ -337,7 +355,10 @@ impl StudioApp {
         self.console = Stream::new(5000);
         self.steps = runner::STEP_NAMES
             .iter()
-            .map(|n| Step { name: (*n).to_string(), state: StepState::Pending })
+            .map(|n| Step {
+                name: (*n).to_string(),
+                state: StepState::Pending,
+            })
             .collect();
         let scenario_args = self
             .scenarios
@@ -387,7 +408,11 @@ impl StudioApp {
         static CONSOLE_DUMP: std::sync::LazyLock<Option<String>> =
             std::sync::LazyLock::new(|| std::env::var("DEERPUNK_STUDIO_CONSOLE").ok());
         if let Some(path) = CONSOLE_DUMP.as_ref() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 use std::io::Write;
                 let _ = f.write_all(bytes);
             }
@@ -425,7 +450,10 @@ impl StudioApp {
 
         // Timers.
         if self.want_connected
-            && matches!(self.conn_state, ConnState::Disconnected | ConnState::Error(_))
+            && matches!(
+                self.conn_state,
+                ConnState::Disconnected | ConnState::Error(_)
+            )
             && self.reconnect_at.is_some_and(|at| Instant::now() >= at)
         {
             self.reconnect();
@@ -498,65 +526,285 @@ impl StudioApp {
     // ------------------------------------------------------------- layout
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if let Some(project) = &self.project {
-                ui.label(
-                    egui::RichText::new(&project.name)
-                        .strong()
-                        .color(theme::TEXT),
-                );
-            } else {
-                ui.label(theme::small("no project — Open…"));
-            }
-            ui.separator();
+        // Three fixed zones: identity + File menu (left), launch cluster
+        // (centered), connect status (right). The cluster holds its place
+        // while the side zones resize.
+        const CENTER_WIDTH: f32 = 640.0;
+        let strip = ui.available_rect_before_wrap();
+        let center_w = CENTER_WIDTH.min(strip.width() * 0.5);
+        let center_left = strip.left() + (strip.width() - center_w) * 0.5;
+        let center_rect = egui::Rect::from_min_max(
+            egui::pos2(center_left, strip.top()),
+            egui::pos2(center_left + center_w, strip.bottom()),
+        );
+        let left_rect = egui::Rect::from_min_max(strip.left_top(), center_rect.left_bottom());
+        let right_rect = egui::Rect::from_min_max(center_rect.right_top(), strip.right_bottom());
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right-to-left order: Run/Stop, then profile, then file
-                // actions — so the profile dropdown sits left of Run.
-                if self.run_state == RunState::Idle {
-                    if ui.button(format!("{}  Run", ph::PLAY)).clicked() {
-                        self.run_instance();
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(left_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        self.top_bar_left(&mut left);
+
+        let mut center = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(center_rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        // `top_down` centers the row horizontally; nudge it down so it is
+        // centered vertically too.
+        center.add_space((center.available_height() - 26.0).max(0.0) * 0.5);
+        center.horizontal(|center| self.top_bar_center(center));
+
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(right_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        self.top_bar_right(&mut right);
+    }
+
+    /// Left zone: clickable game identity (icon + project name) and the
+    /// File menu. Identity click opens the gameinfo modal.
+    fn top_bar_left(&mut self, ui: &mut egui::Ui) {
+        self.identity_block(ui);
+        ui.separator();
+        self.file_menu(ui);
+    }
+
+    /// Game icon box (22px, pulsing accent border) with the project name
+    /// beside it. Both are clickable and open the gameinfo modal.
+    fn identity_block(&mut self, ui: &mut egui::Ui) {
+        let size = egui::vec2(22.0, 22.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::CLICK | egui::Sense::HOVER);
+
+        // Surface + time-driven border pulse (opacity only, no rotation).
+        ui.painter().rect_filled(rect, 2.0, theme::FIELD);
+        let phase = 0.5 + 0.5 * (ui.ctx().input(|i| i.time) * 1.6).sin();
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, tinted(theme::ACCENT, (64.0 + phase * 96.0) as u8)),
+            egui::StrokeKind::Inside,
+        );
+
+        // The game's own icon, or a controller glyph when none loads.
+        // Bytes were decode-checked at load time, so the egui-side load
+        // only ever succeeds (blank for the first frame while it uploads).
+        if let Some(icon) = self.game_icon.clone() {
+            ui.put(
+                rect,
+                egui::Image::new(egui::ImageSource::Bytes {
+                    uri: icon.uri.into(),
+                    bytes: egui::load::Bytes::Shared(icon.bytes),
+                })
+                .fit_to_exact_size(size),
+            );
+        } else {
+            glyph_box(ui, rect);
+        }
+
+        let has_project = self.project.is_some();
+        let name = self
+            .project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "no project".into());
+        let name_resp = ui.add(
+            egui::Button::new(egui::RichText::new(name).strong().color(if has_project {
+                theme::TEXT
+            } else {
+                theme::MUTED
+            }))
+            .fill(egui::Color32::TRANSPARENT)
+            .truncate(),
+        );
+        if resp.clicked() || name_resp.clicked() {
+            self.show_gameinfo_modal = true;
+        }
+        resp.on_hover_text("Game info");
+        name_resp.on_hover_text("Game info");
+    }
+
+    /// Compact `File ▾` menu: open a project folder, reopen recent ones.
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let resp = ui.add(
+            egui::Button::new(
+                egui::RichText::new(format!("File {}", ph::CARET_DOWN)).color(theme::TEXT_DIM),
+            )
+            .fill(egui::Color32::TRANSPARENT),
+        );
+        egui::Popup::menu(&resp).show(|ui| {
+            if ui
+                .button(format!("{}  Open Project…", ph::FOLDER_OPEN))
+                .clicked()
+            {
+                self.pick_folder();
+            }
+            let recents = self.cfg.recents.clone();
+            if !recents.is_empty() {
+                ui.separator();
+                ui.strong(theme::small("Recent"));
+                for recent in recents {
+                    if ui.button(theme::small(recent.clone())).clicked() {
+                        self.open_project(PathBuf::from(recent));
                     }
-                } else {
-                    if ui.button(format!("{}  Stop", ph::STOP)).clicked() {
-                        self.stop_instance();
+                }
+            }
+        });
+    }
+
+    /// Center zone: the launch cluster — profile, scenario, launch/stop,
+    /// and a compact connection dot.
+    fn top_bar_center(&mut self, ui: &mut egui::Ui) {
+        // Run profile.
+        let profile_label = self
+            .profiles
+            .get(&self.active_profile)
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| self.active_profile.clone());
+        egui::ComboBox::from_id_salt("run_profile")
+            .width(130.0)
+            .selected_text(profile_label)
+            .show_ui(ui, |ui| {
+                for id in self.profiles.order.clone() {
+                    let Some(p) = self.profiles.get(&id) else {
+                        continue;
+                    };
+                    if ui
+                        .selectable_label(id == self.active_profile, &p.label)
+                        .clicked()
+                    {
+                        self.active_profile = id;
                     }
-                    ui.label(theme::small(run_state_label(&self.run_state)));
-                }
-                let profile_label = self
-                    .profiles
-                    .get(&self.active_profile)
-                    .map(|p| p.label.clone())
-                    .unwrap_or_else(|| self.active_profile.clone());
-                egui::ComboBox::from_id_salt("run_profile")
-                    .selected_text(profile_label)
-                    .show_ui(ui, |ui| {
-                        for id in self.profiles.order.clone() {
-                            let Some(p) = self.profiles.get(&id) else { continue };
-                            if ui
-                                .selectable_label(id == self.active_profile, &p.label)
-                                .clicked()
-                            {
-                                self.active_profile = id;
-                            }
-                        }
-                    });
-                if ui.button(format!("{}  Open…", ph::FOLDER_OPEN)).clicked() {
-                    self.pick_folder();
-                }
-                if !self.cfg.recents.is_empty() {
-                    egui::ComboBox::from_id_salt("recents")
-                        .selected_text(theme::small("Recents"))
-                        .show_ui(ui, |ui| {
-                            for recent in self.cfg.recents.clone() {
-                                if ui.selectable_label(true, &recent).clicked() {
-                                    self.open_project(PathBuf::from(&recent));
-                                }
-                            }
-                        });
                 }
             });
-        });
+        if gear_button(ui, "Edit run profiles") {
+            self.active_view = View::LaunchSettings;
+        }
+
+        ui.separator();
+
+        // Launch scenario (extra engine args).
+        let scenario_label = self
+            .scenarios
+            .iter()
+            .find(|s| s.id == self.active_scenario)
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| self.active_scenario.clone());
+        egui::ComboBox::from_id_salt("run_scenario")
+            .width(150.0)
+            .selected_text(scenario_label)
+            .show_ui(ui, |ui| {
+                for s in self.scenarios.clone() {
+                    if ui
+                        .selectable_label(s.id == self.active_scenario, &s.label)
+                        .clicked()
+                    {
+                        self.active_scenario = s.id;
+                    }
+                }
+            });
+        if gear_button(ui, "Edit launch scenarios") {
+            self.active_view = View::LaunchSettings;
+        }
+
+        ui.separator();
+
+        // Launch / stop — the one accent-tinted control in the bar.
+        let running = self.run_state != RunState::Idle;
+        let (glyph, label, tint) = if running {
+            (ph::STOP, "Stop", theme::RED)
+        } else {
+            (ph::PLAY, "Play", theme::ACCENT)
+        };
+        let btn = egui::Button::new(
+            egui::RichText::new(format!("{glyph} {label}"))
+                .strong()
+                .color(tint),
+        )
+        .fill(tinted(tint, 0x33))
+        .corner_radius(2.0)
+        .min_size(egui::vec2(86.0, 26.0));
+        let resp = ui.add_enabled(self.project.is_some(), btn);
+        if resp.clicked() {
+            if running {
+                self.stop_instance();
+            } else {
+                self.run_instance();
+            }
+        }
+        if running {
+            ui.label(theme::small(run_state_label(&self.run_state)));
+        }
+
+        ui.separator();
+        connect_dot(ui, &self.conn_state);
+    }
+
+    /// Right zone: connection badge + inspector host:port. The text drops
+    /// out first when the zone runs out of room (badge only).
+    fn top_bar_right(&mut self, ui: &mut egui::Ui) {
+        conn_badge(ui, &self.conn_state);
+        let text = format!("{}:{}", self.host, self.port);
+        if ui.available_width() > text.len() as f32 * 8.0 + 16.0 {
+            ui.label(theme::small(text));
+        }
+    }
+
+    /// Gameinfo modal: opens from the top bar identity block. Backdrop
+    /// click, the × button or Escape all close it.
+    fn gameinfo_modal(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("gameinfo_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(120))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.horizontal(|ui| {
+                    let title = self
+                        .gameinfo
+                        .as_ref()
+                        .map(|i| i.window_title().to_string())
+                        .unwrap_or_else(|| "Game info".into());
+                    ui.strong(title);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(ph::X).frame(false)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                match &self.gameinfo {
+                    Some(info) => {
+                        kv_row(ui, "gamefolder", &info.gamefolder);
+                        kv_row(ui, "title", &info.title);
+                        kv_row(ui, "basedir", &info.basedir);
+                        kv_row(ui, "icon", &info.icon);
+                        kv_row(ui, "version", &info.version);
+                        kv_row(ui, "startmap", &info.startmap);
+                        kv_row(ui, "trainmap", &info.trainmap);
+                        kv_row(ui, "gamedll", &info.gamedll);
+                        if !info.extras.is_empty() {
+                            ui.add_space(4.0);
+                            let mut extras: Vec<(&String, &String)> = info.extras.iter().collect();
+                            extras.sort();
+                            for (k, v) in extras {
+                                kv_row(ui, k, v);
+                            }
+                        }
+                    }
+                    None => {
+                        ui.label(theme::small("no gameinfo.txt"));
+                    }
+                }
+            });
+        if close || modal.backdrop_response.clicked() {
+            self.show_gameinfo_modal = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_gameinfo_modal = false;
+        }
     }
 
     /// Far-left view rail (VS Code activity bar).
@@ -591,7 +839,9 @@ impl StudioApp {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 let toggle = ph::TERMINAL_WINDOW;
                 let btn = egui::Button::new(
-                    egui::RichText::new(toggle).color(theme::TEXT_DIM).size(14.0),
+                    egui::RichText::new(toggle)
+                        .color(theme::TEXT_DIM)
+                        .size(14.0),
                 )
                 .fill(egui::Color32::TRANSPARENT)
                 .min_size(egui::vec2(36.0, 24.0));
@@ -713,7 +963,11 @@ impl StudioApp {
                         "{} files · {} · gamedir {}",
                         scan.entries.len(),
                         assets::fmt_size(bytes),
-                        if project.gamedir_valid() { "ok" } else { "missing" }
+                        if project.gamedir_valid() {
+                            "ok"
+                        } else {
+                            "missing"
+                        }
                     )));
                 } else if self.scan_rx.is_some() {
                     ui.label(theme::small("scanning…"));
@@ -757,23 +1011,30 @@ impl eframe::App for StudioApp {
 
         // Paint the whole window first so no platform clear color leaks.
         let full = ui.available_rect_before_wrap();
-        ui.painter()
-            .rect_filled(full, 0.0, theme::BG);
+        ui.painter().rect_filled(full, 0.0, theme::BG);
 
         egui::Panel::top("topbar")
             .resizable(false)
-            .exact_size(30.0)
+            .exact_size(36.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::HEADER)
-                    .inner_margin(egui::Margin::symmetric(8, 2)),
+                    .fill(if self.run_state == RunState::Idle {
+                        theme::HEADER
+                    } else {
+                        theme::BAR_ACTIVE
+                    })
+                    .inner_margin(egui::Margin::symmetric(8, 3)),
             )
             .show(ui, |ui| self.top_bar(ui));
 
         egui::Panel::left("rail")
             .resizable(false)
             .exact_size(48.0)
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(4, 2)))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(4, 2)),
+            )
             .show(ui, |ui| self.rail(ui));
 
         egui::Panel::left("sidebar")
@@ -808,11 +1069,19 @@ impl eframe::App for StudioApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(10)))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::same(10)),
+            )
             .show(ui, |ui| {
                 let view = self.active_view.clone();
                 panels::center(ui, self, &view);
             });
+
+        if self.show_gameinfo_modal {
+            self.gameinfo_modal(ui.ctx());
+        }
 
         if let Some(project) = &self.project {
             let title = self
@@ -820,9 +1089,10 @@ impl eframe::App for StudioApp {
                 .as_ref()
                 .map(|i| i.window_title().to_string())
                 .unwrap_or_else(|| project.name.clone());
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "deerpunk studio — {title}"
-            )));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                    "deerpunk studio — {title}"
+                )));
         }
     }
 }
@@ -849,22 +1119,93 @@ fn live_glyph(id: &str) -> &'static str {
     }
 }
 
+fn conn_label(state: &ConnState) -> &'static str {
+    match state {
+        ConnState::Connected => "connected",
+        ConnState::Connecting => "connecting",
+        ConnState::Disconnected => "disconnected",
+        ConnState::Error(_) => "error",
+    }
+}
+
+fn conn_color(state: &ConnState) -> egui::Color32 {
+    match state {
+        ConnState::Connected => theme::GREEN,
+        ConnState::Connecting => theme::YELLOW,
+        ConnState::Disconnected => theme::MUTED,
+        ConnState::Error(_) => theme::RED,
+    }
+}
+
+/// RGB of `color` at an explicit alpha (unmultiplied).
+fn tinted(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied_const(color.r(), color.g(), color.b(), alpha)
+}
+
 fn conn_badge(ui: &mut egui::Ui, state: &ConnState) {
-    let (text, color) = match state {
-        ConnState::Connected => ("connected", theme::GREEN),
-        ConnState::Connecting => ("connecting", theme::YELLOW),
-        ConnState::Disconnected => ("disconnected", theme::MUTED),
-        ConnState::Error(_) => ("error", theme::RED),
-    };
-    let fill =
-        egui::Color32::from_rgba_unmultiplied_const(color.r(), color.g(), color.b(), 0x33);
+    let color = conn_color(state);
     egui::Frame::new()
-        .fill(fill)
+        .fill(tinted(color, 0x33))
         .corner_radius(2.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(theme::mono_colored(text, color));
+            ui.label(theme::mono_colored(conn_label(state), color));
         });
+}
+
+/// Compact connection indicator at the end of the launch cluster.
+fn connect_dot(ui: &mut egui::Ui, state: &ConnState) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::HOVER);
+    ui.painter()
+        .circle_filled(rect.center(), 4.0, conn_color(state));
+    resp.on_hover_text(conn_label(state));
+}
+
+/// Frameless 18px gear button; returns true when clicked.
+fn gear_button(ui: &mut egui::Ui, tooltip: &str) -> bool {
+    let resp = ui.add(
+        egui::Button::new(
+            egui::RichText::new(ph::GEAR)
+                .size(13.0)
+                .color(theme::TEXT_DIM),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .min_size(egui::vec2(18.0, 18.0)),
+    );
+    resp.on_hover_text(tooltip).clicked()
+}
+
+/// Fallback content of the identity icon box: a controller glyph.
+fn glyph_box(ui: &mut egui::Ui, rect: egui::Rect) {
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ph::GAME_CONTROLLER,
+        egui::FontId::proportional(13.0),
+        theme::TEXT_DIM,
+    );
+}
+
+/// Read the project's game icon and decode-check it up front, so the
+/// egui-side load can only ever succeed (async, cached, no per-frame IO).
+/// Missing file or undecodable bytes yield `None` and the identity block
+/// keeps its controller glyph.
+fn load_game_icon(gamedir: &std::path::Path, info: &GameInfo) -> Option<GameIcon> {
+    let path = info.icon_path(gamedir)?;
+    let bytes = std::fs::read(&path).ok()?;
+    image::load_from_memory(&bytes).ok()?;
+    Some(GameIcon {
+        uri: format!("bytes://{}", path.display()),
+        bytes: bytes.into(),
+    })
+}
+
+/// `key value` row (modal variant; panels.rs owns the sidebar original).
+fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.strong(key);
+        ui.label(theme::mono_text(value));
+    });
 }
 
 pub const KINDS: [AssetKind; 18] = [
@@ -900,11 +1241,13 @@ fn absolute(p: &std::path::Path) -> PathBuf {
 /// Load `.deerpunk/scenarios.toml` — `[scenario.<id>] label = "…"; args = […]`.
 /// Missing file yields the built-in empty `default` scenario.
 fn load_scenarios(project_root: &std::path::Path) -> Vec<Scenario> {
-    let fallback = || vec![Scenario {
-        id: "default".into(),
-        label: "Default".into(),
-        args: Vec::new(),
-    }];
+    let fallback = || {
+        vec![Scenario {
+            id: "default".into(),
+            label: "Default".into(),
+            args: Vec::new(),
+        }]
+    };
     let Ok(text) = std::fs::read_to_string(project_root.join(".deerpunk/scenarios.toml")) else {
         return fallback();
     };
@@ -916,9 +1259,13 @@ fn load_scenarios(project_root: &std::path::Path) -> Vec<Scenario> {
     };
     let mut out = Vec::new();
     for (id, value) in table {
-        let label = value.get("label").and_then(|v| v.as_str()).unwrap_or(id).to_string();
+        let label = value
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or(id)
+            .to_string();
         let args = value
- .get("args")
+            .get("args")
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
@@ -926,11 +1273,11 @@ fn load_scenarios(project_root: &std::path::Path) -> Vec<Scenario> {
                     .collect()
             })
             .unwrap_or_default();
-        out.push(Scenario { id: id.clone(), label, args });
+        out.push(Scenario {
+            id: id.clone(),
+            label,
+            args,
+        });
     }
-    if out.is_empty() {
-        fallback()
-    } else {
-        out
-    }
+    if out.is_empty() { fallback() } else { out }
 }

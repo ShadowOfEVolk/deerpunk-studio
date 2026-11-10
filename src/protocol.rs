@@ -93,8 +93,15 @@ pub fn notification(method: &str, params: Value) -> String {
 
 /// Parsed incoming message: a reply, an error reply, or noise.
 pub enum Incoming {
-    Reply { id: u64, result: Value },
-    RpcError { id: Option<u64>, code: i64, message: String },
+    Reply {
+        id: u64,
+        result: Value,
+    },
+    RpcError {
+        id: Option<u64>,
+        code: i64,
+        message: String,
+    },
 }
 
 pub fn parse_incoming(text: &str) -> Option<Incoming> {
@@ -196,7 +203,10 @@ mod tests {
         let init: InitializeResult = serde_json::from_value(result).unwrap();
         assert_eq!(init.server, "deerpunk");
         assert_eq!(init.collections.len(), 1);
-        assert_eq!(init.collections[0].modes, vec![CollectionMode::List, CollectionMode::Get]);
+        assert_eq!(
+            init.collections[0].modes,
+            vec![CollectionMode::List, CollectionMode::Get]
+        );
     }
 
     #[test]
@@ -204,9 +214,10 @@ mod tests {
         let tag: ComponentSnapshot =
             serde_json::from_value(json!({"slug":"Player","kind":"tag"})).unwrap();
         assert!(matches!(tag, ComponentSnapshot::Tag { .. }));
-        let data: ComponentSnapshot =
-            serde_json::from_value(json!({"slug":"TransformComponent","data":{"position":[0,0,0]}}))
-                .unwrap();
+        let data: ComponentSnapshot = serde_json::from_value(
+            json!({"slug":"TransformComponent","data":{"position":[0,0,0]}}),
+        )
+        .unwrap();
         match data {
             ComponentSnapshot::Data { slug, data, .. } => {
                 assert_eq!(slug, "TransformComponent");

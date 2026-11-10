@@ -7,7 +7,7 @@ edition = "2024"
 dirs = "7.0.0"
 eframe = "0.36"
 egui-phosphor = "0.14"
-egui_extras = { version = "0.36", features = ["image", "svg"] }
+egui_extras = { version = "0.36", features = ["file", "image", "svg"] }
 image = "0.25.10"
 libc = "0.2.191"
 rfd = "0.18.0"

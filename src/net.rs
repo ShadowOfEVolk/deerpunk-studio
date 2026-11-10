@@ -46,7 +46,10 @@ impl NetClient {
             .name("inspector-ws".into())
             .spawn(move || run(cmd_rx, event_tx))
             .expect("spawn inspector-ws thread");
-        Self { tx: cmd_tx, rx: event_rx }
+        Self {
+            tx: cmd_tx,
+            rx: event_rx,
+        }
     }
 
     pub fn cmd(&self, cmd: NetCmd) {
@@ -110,7 +113,8 @@ fn run(cmd_rx: Receiver<NetCmd>, event_tx: Sender<NetEvent>) {
                                 if let Loop::Live(ws) = &mut state {
                                     if push_text(ws, &line).is_err() {
                                         state = Loop::Idle;
-                                        let _ = event_tx.send(NetEvent::State(ConnState::Disconnected));
+                                        let _ =
+                                            event_tx.send(NetEvent::State(ConnState::Disconnected));
                                     }
                                 }
                             }
@@ -216,7 +220,10 @@ mod tests {
         let client = NetClient::new();
         assert!(client.poll().is_empty());
         // Connecting to a dead port yields an error state event.
-        client.cmd(NetCmd::Connect { host: "127.0.0.1".into(), port: 1 });
+        client.cmd(NetCmd::Connect {
+            host: "127.0.0.1".into(),
+            port: 1,
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let events = client.poll();
@@ -226,7 +233,10 @@ mod tests {
             {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "no error state in time");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no error state in time"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }

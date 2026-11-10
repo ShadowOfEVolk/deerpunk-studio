@@ -81,7 +81,11 @@ const fn c(hex: &str) -> Color32 {
         )
     } else {
         // #RRGGBB: opaque — never treat the blue byte as alpha.
-        Color32::from_rgb(((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+        Color32::from_rgb(
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        )
     }
 }
 
@@ -157,11 +161,26 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.scroll.bar_inner_margin = 2.0;
         style.spacing.scroll.bar_width = 8.0;
 
-        style.text_styles.insert(TextStyle::Body, FontId::new(13.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Button, FontId::new(13.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Small, FontId::new(11.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, egui::FontFamily::Monospace));
-        style.text_styles.insert(TextStyle::Heading, FontId::new(15.0, egui::FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Body,
+            FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(11.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(13.0, egui::FontFamily::Monospace),
+        );
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(15.0, egui::FontFamily::Proportional),
+        );
     });
 }
 
