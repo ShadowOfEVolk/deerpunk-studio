@@ -102,6 +102,10 @@ pub fn console_soften(color: Color32) -> Color32 {
 pub fn apply(ctx: &egui::Context) {
     // Pin the theme: a light OS appearance must never flip panels back to white.
     ctx.set_theme(egui::ThemePreference::Dark);
+    // Icon font (Phosphor regular) as a proportional fallback + named family.
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::variants::Variant::Regular);
+    ctx.set_fonts(fonts);
     ctx.all_styles_mut(|style| {
         let v = &mut style.visuals;
         *v = Visuals::dark();

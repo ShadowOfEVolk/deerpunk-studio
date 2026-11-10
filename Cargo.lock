@@ -778,7 +778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -928,6 +928,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "eframe",
+ "egui-phosphor",
  "egui_extras",
  "egui_kittest",
  "image",
@@ -1107,6 +1108,15 @@ dependencies = [
  "smallvec",
  "unicode-segmentation",
  "web-sys",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
 ]
 
 [[package]]

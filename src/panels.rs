@@ -11,6 +11,7 @@ use crate::assets::AssetKind;
 use crate::net::ConnState;
 use crate::protocol::{self, ComponentSnapshot};
 use crate::runner::StepState;
+use egui_phosphor::variants::regular as ph;
 use crate::theme;
 
 /// Sidebar content for the active view (resource lists).
@@ -56,7 +57,7 @@ fn sidebar_header(ui: &mut egui::Ui, title: &str, count: impl Into<String>) {
 
 fn filter_box(ui: &mut egui::Ui, text: &mut String, hint: &str) {
     ui.horizontal(|ui| {
-        ui.label(theme::small("🔍"));
+        ui.label(theme::small(ph::MAGNIFYING_GLASS));
         ui.add(
             egui::TextEdit::singleline(text)
                 .hint_text(egui::RichText::new(hint).small().color(theme::FAINT))

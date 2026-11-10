@@ -20,6 +20,7 @@ use crate::project::Project;
 use crate::protocol::{self, CollectionDescriptor};
 use crate::runner::{self, Event as RunEvent, Runner, RunState, Step, StepState};
 use crate::theme;
+use egui_phosphor::variants::regular as ph;
 
 /// Top-level views, switched from the left rail (VS Code activity bar).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -470,11 +471,11 @@ impl StudioApp {
                 // Right-to-left order: Run/Stop, then profile, then file
                 // actions — so the profile dropdown sits left of Run.
                 if self.run_state == RunState::Idle {
-                    if ui.button("▶ Run").clicked() {
+                    if ui.button(format!("{}  Run", ph::PLAY)).clicked() {
                         self.run_instance();
                     }
                 } else {
-                    if ui.button("■ Stop").clicked() {
+                    if ui.button(format!("{}  Stop", ph::STOP)).clicked() {
                         self.stop_instance();
                     }
                     ui.label(theme::small(run_state_label(&self.run_state)));
@@ -497,7 +498,7 @@ impl StudioApp {
                             }
                         }
                     });
-                if ui.button("Open…").clicked() {
+                if ui.button(format!("{}  Open…", ph::FOLDER_OPEN)).clicked() {
                     self.pick_folder();
                 }
                 if !self.cfg.recents.is_empty() {
@@ -519,11 +520,11 @@ impl StudioApp {
     fn rail(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.add_space(6.0);
-            self.rail_button(ui, View::Project, "⌂", "Project");
-            self.rail_button(ui, View::DiskAssets, "▦", "Disk assets");
-            self.rail_button(ui, View::Textures, "▣", "Textures");
-            self.rail_button(ui, View::Cvars, "⚙", "Cvars");
-            self.rail_button(ui, View::Raw, "☰", "deerpunk.toml raw");
+            self.rail_button(ui, View::Project, ph::HOUSE, "Project");
+            self.rail_button(ui, View::DiskAssets, ph::HARD_DRIVES, "Disk assets");
+            self.rail_button(ui, View::Textures, ph::IMAGE, "Textures");
+            self.rail_button(ui, View::Cvars, ph::SLIDERS, "Cvars");
+            self.rail_button(ui, View::Raw, ph::FILE_TEXT, "deerpunk.toml raw");
 
             // Live collections (from the engine handshake).
             if !self.collections.is_empty() {
@@ -545,7 +546,7 @@ impl StudioApp {
 
             // Bottom: console toggle.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                let toggle = if self.console_open { "▾" } else { "▴" };
+                let toggle = ph::TERMINAL_WINDOW;
                 let btn = egui::Button::new(
                     egui::RichText::new(toggle).color(theme::TEXT_DIM).size(14.0),
                 )
@@ -578,13 +579,20 @@ impl StudioApp {
                 .color(color)
                 .size(11.0)
         } else {
-            egui::RichText::new(glyph).color(color).size(15.0)
+            egui::RichText::new(glyph).color(color).size(17.0)
         };
         let btn = egui::Button::new(text)
             .fill(fill)
             .corner_radius(4.0)
             .min_size(egui::vec2(38.0, 30.0));
         let resp = ui.add(btn);
+        // VS Code-style active marker: accent stripe at the left edge.
+        if active {
+            let mut stripe = resp.rect;
+            stripe.set_width(3.0);
+            stripe = stripe.translate(egui::vec2(-6.0, 0.0));
+            ui.painter().rect_filled(stripe, 1.0, theme::ACCENT);
+        }
         if resp.clicked() {
             self.active_view = view;
         }
@@ -788,13 +796,13 @@ fn run_state_label(state: &RunState) -> String {
 
 fn live_glyph(id: &str) -> &'static str {
     match id {
-        "entities" => "◈",
-        "assets" => "◧",
-        "players" => "☻",
-        "systems" => "▤",
-        "fmod_events" => "♪",
-        "methoddb" => "≡",
-        _ => "◇",
+        "entities" => ph::CUBE,
+        "assets" => ph::STACK,
+        "players" => ph::USERS_THREE,
+        "systems" => ph::GAUGE,
+        "fmod_events" => ph::MUSIC_NOTES_SIMPLE,
+        "methoddb" => ph::LIST_DASHES,
+        _ => ph::DATABASE,
     }
 }
 
