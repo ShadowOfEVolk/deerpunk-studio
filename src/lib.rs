@@ -5,6 +5,7 @@ pub mod app;
 pub mod assets;
 pub mod config;
 pub mod gameinfo;
+pub mod native_menu;
 pub mod net;
 pub mod panels;
 pub mod profiles;

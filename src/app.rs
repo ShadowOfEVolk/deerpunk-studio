@@ -130,6 +130,8 @@ pub struct StudioApp {
 
     // Game info modal (top bar icon click).
     pub show_gameinfo_modal: bool,
+    /// Recents snapshot pushed to the native menu last.
+    pub last_recents: Vec<String>,
     /// The project's game icon, loaded eagerly (see [`GameIcon`]).
     pub game_icon: Option<GameIcon>,
 
@@ -145,6 +147,8 @@ impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>, args: &[String]) -> Self {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Native system File menu (macOS menubar; no-op elsewhere).
+        crate::native_menu::install();
 
         let cfg = StudioConfig::load();
         let mut app = Self {
@@ -189,6 +193,7 @@ impl StudioApp {
             }],
             active_scenario: "default".into(),
             show_gameinfo_modal: false,
+            last_recents: Vec::new(),
             game_icon: None,
             assets_filter: String::new(),
             assets_kind: None,
@@ -565,12 +570,10 @@ impl StudioApp {
         self.top_bar_right(&mut right);
     }
 
-    /// Left zone: clickable game identity (icon + project name) and the
-    /// File menu. Identity click opens the gameinfo modal.
+    /// Left zone: clickable game identity (icon + project name); click opens
+    /// the gameinfo modal. Open/Recent live in the native system File menu.
     fn top_bar_left(&mut self, ui: &mut egui::Ui) {
         self.identity_block(ui);
-        ui.separator();
-        self.file_menu(ui);
     }
 
     /// Game icon box (22px, pulsing accent border) with the project name
@@ -627,33 +630,23 @@ impl StudioApp {
         name_resp.on_hover_text("Game info");
     }
 
-    /// Compact `File ▾` menu: open a project folder, reopen recent ones.
-    fn file_menu(&mut self, ui: &mut egui::Ui) {
-        let resp = ui.add(
-            egui::Button::new(
-                egui::RichText::new(format!("File {}", ph::CARET_DOWN)).color(theme::TEXT_DIM),
-            )
-            .fill(egui::Color32::TRANSPARENT),
-        );
-        egui::Popup::menu(&resp).show(|ui| {
-            if ui
-                .button(format!("{}  Open Project…", ph::FOLDER_OPEN))
-                .clicked()
-            {
-                self.pick_folder();
-            }
-            let recents = self.cfg.recents.clone();
-            if !recents.is_empty() {
-                ui.separator();
-                ui.strong(theme::small("Recent"));
-                for recent in recents {
-                    if ui.button(theme::small(recent.clone())).clicked() {
-                        self.open_project(PathBuf::from(recent));
-                    }
+    /// Native macOS File menu: drain clicks, keep "Open Recent" in sync.
+    fn poll_native_menu(&mut self) {
+        for action in crate::native_menu::poll_actions() {
+            match action {
+                crate::native_menu::NativeMenuAction::OpenProject => self.pick_folder(),
+                crate::native_menu::NativeMenuAction::OpenRecent(path) => {
+                    self.open_project(PathBuf::from(path))
                 }
             }
-        });
+        }
+        let recents = self.cfg.recents.clone();
+        if recents != self.last_recents {
+            crate::native_menu::set_recents(&recents);
+            self.last_recents = recents;
+        }
     }
+
 
     /// Center zone: the launch cluster — profile, scenario, launch/stop,
     /// and a compact connection dot.
@@ -1007,6 +1000,7 @@ impl eframe::App for StudioApp {
         self.poll_scan();
         self.poll_net();
         self.poll_runner();
+        self.poll_native_menu();
         self.handle_dropped_files(ui);
 
         // Paint the whole window first so no platform clear color leaks.
