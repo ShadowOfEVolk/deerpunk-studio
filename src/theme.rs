@@ -1,37 +1,48 @@
-//! Design tokens ported from `deerpunk-inspector` (dark, teal accent) and
-//! applied to the egui style. Data rows use the monospace font.
+//! Blender-inspired dark theme: flat neutral grays, slightly lighter header
+//! strips, sharp corners, dense layout, blue selection. Applied to the egui
+//! style; data rows use the monospace font.
 
-use eframe::egui::{self, Color32, Visuals};
+use eframe::egui::{self, Color32, FontId, TextStyle, Visuals};
 
-pub const BG: Color32 = c("#090a0c");
-pub const PANEL: Color32 = c("#14161c");
-pub const HEADER: Color32 = c("#1a1d23");
-pub const CARD: Color32 = c("#111318");
-pub const CARD_BORDER: Color32 = c("#1c1f27");
-pub const BORDER: Color32 = c("#2a2d35");
-pub const ZEBRA: Color32 = c("#0d0f14");
-pub const HOVER: Color32 = c("#1a1d2388");
+// Base surfaces (Blender: editor body / header strips / inputs).
+pub const BG: Color32 = c("#1d1d1d");
+pub const PANEL: Color32 = c("#282828");
+pub const HEADER: Color32 = c("#232323");
+pub const CARD: Color32 = c("#2e2e2e");
+pub const CARD_BORDER: Color32 = c("#3a3a3a");
+pub const FIELD: Color32 = c("#353535");
+pub const BORDER: Color32 = c("#3f3f3f");
+pub const BORDER_DARK: Color32 = c("#161616");
+pub const ZEBRA: Color32 = c("#2c2c2c");
+pub const HOVER: Color32 = c("#3a3a3a");
 
-pub const TEXT: Color32 = c("#d1d5db");
-pub const TEXT_DIM: Color32 = c("#9ca3af");
-pub const MUTED: Color32 = c("#6b7280");
-pub const FAINT: Color32 = c("#4b5563");
-pub const GHOST: Color32 = c("#374151");
+// Text.
+pub const TEXT: Color32 = c("#e6e6e6");
+pub const TEXT_DIM: Color32 = c("#a0a0a0");
+pub const MUTED: Color32 = c("#858585");
+pub const FAINT: Color32 = c("#6e6e6e");
+pub const GHOST: Color32 = c("#5a5a5a");
 
-pub const ACCENT: Color32 = c("#2cb1bc");
-pub const ACCENT_TEXT: Color32 = c("#5eead4");
-pub const CYAN: Color32 = c("#22d3ee");
-pub const GREEN: Color32 = c("#22c55e");
-pub const YELLOW: Color32 = c("#eab308");
-pub const RED: Color32 = c("#ef4444");
+// Accents (Blender: blue selection, orange active object).
+pub const ACCENT: Color32 = c("#4772b3");
+pub const ACCENT_TEXT: Color32 = c("#cfe0f4");
+pub const ORANGE: Color32 = c("#ff9c29");
 
-// JsonView syntax colors (inspector JsonView.tsx).
-pub const J_KEY: Color32 = c("#93c5fd");
-pub const J_STRING: Color32 = c("#86efac");
-pub const J_NUMBER: Color32 = c("#fdba74");
-pub const J_BOOL: Color32 = c("#c4b5fd");
-pub const J_NULL: Color32 = c("#6b7280");
-pub const J_PUNCT: Color32 = c("#6b7280");
+// Status colors.
+pub const GREEN: Color32 = c("#5f9e57");
+pub const YELLOW: Color32 = c("#d0a13e");
+pub const RED: Color32 = c("#d4483d");
+
+// Tabs (workspace strip + dock tab bars).
+pub const TAB_INACTIVE: Color32 = c("#9a9a9a");
+
+// JsonView syntax colors (desaturated to fit the neutral surface).
+pub const J_KEY: Color32 = c("#9db9dd");
+pub const J_STRING: Color32 = c("#a5d6a7");
+pub const J_NUMBER: Color32 = c("#e6b980");
+pub const J_BOOL: Color32 = c("#c3aed6");
+pub const J_NULL: Color32 = c("#808080");
+pub const J_PUNCT: Color32 = c("#808080");
 
 const fn hex_val(b: u8) -> u32 {
     match b {
@@ -58,7 +69,7 @@ const fn c(hex: &str) -> Color32 {
     )
 }
 
-/// Apply inspector palette to the egui style (dark, subtle borders).
+/// Apply the Blender-inspired look: flat, sharp, dense.
 pub fn apply(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         let v = &mut style.visuals;
@@ -68,38 +79,55 @@ pub fn apply(ctx: &egui::Context) {
         v.extreme_bg_color = BG;
         v.faint_bg_color = ZEBRA;
         v.window_fill = PANEL;
+        v.override_text_color = Some(TEXT);
+
+        // Blender widgets: flat #353535 fields, #4772b3 press/selection.
         v.widgets.noninteractive.bg_fill = HEADER;
         v.widgets.noninteractive.weak_bg_fill = HEADER;
-        v.widgets.noninteractive.fg_stroke.color = TEXT_DIM;
-        v.widgets.noninteractive.bg_stroke = stroke(BORDER);
-        v.widgets.inactive.bg_fill = HEADER;
-        v.widgets.inactive.weak_bg_fill = HEADER;
-        v.widgets.inactive.bg_stroke = stroke(CARD_BORDER);
-        v.widgets.hovered.bg_fill = HEADER;
-        v.widgets.hovered.weak_bg_fill = HEADER;
-        v.widgets.hovered.bg_stroke = stroke(BORDER);
-        v.widgets.active.bg_fill = CARD;
-        v.widgets.active.weak_bg_fill = CARD;
-        v.widgets.active.bg_stroke = stroke(ACCENT);
-        v.selection.bg_fill = with_a(ACCENT, 0x33);
-        v.selection.stroke = stroke(ACCENT);
-        v.override_text_color = Some(TEXT);
-        v.window_stroke = stroke(BORDER);
-        v.widgets.noninteractive.corner_radius = 4.0.into();
-        v.widgets.inactive.corner_radius = 4.0.into();
-        v.widgets.hovered.corner_radius = 4.0.into();
-        v.widgets.active.corner_radius = 4.0.into();
-        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-        style.spacing.button_padding = egui::vec2(8.0, 3.0);
+        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_DIM);
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER_DARK);
+        v.widgets.inactive.bg_fill = FIELD;
+        v.widgets.inactive.weak_bg_fill = FIELD;
+        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        v.widgets.hovered.bg_fill = HOVER;
+        v.widgets.hovered.weak_bg_fill = HOVER;
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        v.widgets.active.bg_fill = ACCENT;
+        v.widgets.active.weak_bg_fill = ACCENT;
+        v.widgets.active.bg_stroke = egui::Stroke::NONE;
+        v.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+
+        v.selection.bg_fill = ACCENT;
+        v.selection.stroke = egui::Stroke::NONE;
+        v.window_stroke = egui::Stroke::new(1.0, BORDER);
+        v.window_fill = PANEL;
+        v.window_shadow = egui::Shadow::NONE;
+        v.popup_shadow = egui::Shadow::NONE;
+
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+        ] {
+            w.corner_radius = 2.0.into();
+        }
+
+        // Density.
+        style.spacing.item_spacing = egui::vec2(6.0, 3.0);
+        style.spacing.button_padding = egui::vec2(8.0, 2.0);
+        style.spacing.menu_margin = egui::Margin::same(2);
+        style.spacing.interact_size = egui::vec2(60.0, 20.0);
+        style.spacing.scroll.bar_inner_margin = 2.0;
+        style.spacing.scroll.bar_width = 8.0;
+
+        style.text_styles.insert(TextStyle::Body, FontId::new(13.0, egui::FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Button, FontId::new(13.0, egui::FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Small, FontId::new(11.0, egui::FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, egui::FontFamily::Monospace));
+        style.text_styles.insert(TextStyle::Heading, FontId::new(15.0, egui::FontFamily::Proportional));
     });
-}
-
-fn stroke(color: Color32) -> egui::Stroke {
-    egui::Stroke::new(1.0, color)
-}
-
-fn with_a(c: Color32, a: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied_const(c.r(), c.g(), c.b(), a)
 }
 
 /// Monospace rich text for data rows.
@@ -117,12 +145,17 @@ pub fn mono_colored(text: impl Into<String>, color: Color32) -> egui::RichText {
     mono(text).color(color)
 }
 
-/// Small pill badge (inspector `Badge` component).
+/// Small dim text (status bar).
+pub fn small(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into()).small().color(TEXT_DIM)
+}
+
+/// Small pill badge.
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
     let fill = Color32::from_rgba_unmultiplied_const(color.r(), color.g(), color.b(), 0x22);
     egui::Frame::new()
         .fill(fill)
-        .corner_radius(4.0)
+        .corner_radius(2.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(mono_colored(text, color));
