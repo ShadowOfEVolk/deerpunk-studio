@@ -58,6 +58,8 @@ pub struct InstancePlan {
     pub engine_dir: PathBuf,
     pub profile: RunProfile,
     pub gamelibs: Vec<GameLib>,
+    /// Extra engine CLI args from the active scenario.
+    pub extra_args: Vec<String>,
 }
 
 enum Cmd {
@@ -360,7 +362,8 @@ fn step_launch_engine(
         .arg("--svlib")
         .arg(lib_path_for(plan, "server"))
         .arg("--cllib")
-        .arg(lib_path_for(plan, "client"));
+        .arg(lib_path_for(plan, "client"))
+        .args(&plan.extra_args);
 
     // Same PATH handling as run.sh: gamelib loader dirs first.
     let engine_target = plan

@@ -6,7 +6,7 @@ use eframe::egui;
 use serde_json::Value;
 
 use crate::ansi::{self, Stream};
-use crate::app::{ProjectDoc, StudioApp, View};
+use crate::app::{StudioApp, View};
 use crate::assets::AssetKind;
 use crate::net::ConnState;
 use crate::protocol::{self, ComponentSnapshot};
@@ -17,11 +17,12 @@ use crate::theme;
 /// Sidebar content for the active view (resource lists).
 pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
     match view {
-        View::Project => project_sidebar(ui, app),
+        View::Files => files_sidebar(ui, app),
         View::DiskAssets => assets_sidebar(ui, app),
         View::Textures => textures_sidebar(ui, app),
         View::Cvars => cvars_sidebar(ui, app),
         View::Raw => raw_sidebar(ui),
+        View::LaunchSettings => launch_settings_sidebar(ui),
         View::Live(id) => collection_sidebar(ui, app, id),
     }
 }
@@ -29,13 +30,33 @@ pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
 /// Center content for the active view.
 pub fn center(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
     match view {
-        View::Project => project_center(ui, app),
+        View::Files => files_center(ui, app),
         View::DiskAssets => assets_center(ui, app),
         View::Textures => textures_center(ui, app),
         View::Cvars => cvars_center(ui, app),
         View::Raw => raw_center(ui, app),
+        View::LaunchSettings => launch_settings_center(ui, app),
         View::Live(_) => detail_panel(ui, app),
     }
+}
+
+fn files_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
+    sidebar_header(ui, "Files", "browser");
+    ui.weak("file tree lands here");
+}
+
+fn files_center(ui: &mut egui::Ui, app: &mut StudioApp) {
+    ui.centered_and_justified(|ui| ui.weak("file viewers land here"));
+}
+
+fn launch_settings_sidebar(ui: &mut egui::Ui) {
+    sidebar_header(ui, "Launch", "settings");
+    ui.weak("profiles & scenarios");
+}
+
+fn launch_settings_center(ui: &mut egui::Ui, app: &mut StudioApp) {
+    ui.strong("Launch settings");
+    ui.weak("profile & scenario editor lands here");
 }
 
 fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
@@ -87,101 +108,6 @@ fn selected_text_color(selected: bool) -> egui::Color32 {
     }
 }
 
-// ------------------------------------------------------------- project view
-
-fn project_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
-    sidebar_header(ui, "Project", if app.project.is_some() { "ready" } else { "none" });
-    for (doc, label) in [
-        (ProjectDoc::Summary, "Summary"),
-        (ProjectDoc::Toml, "deerpunk.toml"),
-        (ProjectDoc::GameInfo, "gameinfo.txt"),
-    ] {
-        let selected = app.project_doc == doc;
-        if sidebar_row(
-            ui,
-            selected,
-            egui::RichText::new(label).color(selected_text_color(selected)),
-        )
-        .clicked()
-        {
-            app.project_doc = doc;
-        }
-    }
-}
-
-fn project_center(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let Some(project) = app.project.clone() else {
-        ui.centered_and_justified(|ui| {
-            ui.weak("no project open — Open… or drag a folder here");
-        });
-        return;
-    };
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        match app.project_doc {
-            ProjectDoc::Summary => {
-                ui.heading("deerpunk.toml");
-                kv_row(ui, "project root", &project.root.display().to_string());
-                kv_row(ui, "project.name", &project.name);
-                kv_row(
-                    ui,
-                    "engine.gamedir",
-                    &format!(
-                        "{} {}",
-                        project.gamedir.display(),
-                        if project.gamedir_valid() { "(ok)" } else { "(missing)" }
-                    ),
-                );
-                kv_row(ui, "engine.path", &project.engine_dir.display().to_string());
-                for lib in &project.gamelibs {
-                    kv_row(
-                        ui,
-                        "launch.gamelibs",
-                        &format!("{} → {} ({})", lib.package, lib.artifact, lib.slot),
-                    );
-                }
-                for (key, value) in &project.extras {
-                    kv_row(ui, key, value);
-                }
-                ui.add_space(12.0);
-                ui.heading("gameinfo.txt");
-                if let Some(info) = &app.gameinfo {
-                    kv_row(ui, "gamefolder", &info.gamefolder);
-                    kv_row(ui, "title", info.window_title());
-                    kv_row(ui, "basedir", &info.basedir);
-                    kv_row(ui, "icon", &info.icon);
-                    kv_row(ui, "version", &info.version);
-                    let mut extras: Vec<_> = info.extras.iter().collect();
-                    extras.sort();
-                    for (k, v) in extras {
-                        kv_row(ui, k, v);
-                    }
-                }
-            }
-            ProjectDoc::Toml => {
-                ui.monospace(&project.raw);
-            }
-            ProjectDoc::GameInfo => {
-                if let Some(info) = &app.gameinfo {
-                    kv_row(ui, "gamefolder", &info.gamefolder);
-                    kv_row(ui, "title", info.window_title());
-                    kv_row(ui, "basedir", &info.basedir);
-                    kv_row(ui, "icon", &info.icon);
-                    kv_row(ui, "version", &info.version);
-                    kv_row(ui, "startmap", &info.startmap);
-                    kv_row(ui, "trainmap", &info.trainmap);
-                    kv_row(ui, "gamedll", &info.gamedll);
-                    let mut extras: Vec<_> = info.extras.iter().collect();
-                    extras.sort();
-                    for (k, v) in extras {
-                        kv_row(ui, k, v);
-                    }
-                } else {
-                    ui.weak("gamedir not resolved");
-                }
-            }
-        }
-    });
-}
 
 // -------------------------------------------------------------- assets view
 

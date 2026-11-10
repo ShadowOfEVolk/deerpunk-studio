@@ -25,8 +25,8 @@ use egui_phosphor::variants::regular as ph;
 /// Top-level views, switched from the left rail (VS Code activity bar).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum View {
-    /// deerpunk.toml + gameinfo summary/documents.
-    Project,
+    /// Hierarchical file browser (project root + gamedir).
+    Files,
     /// Files on disk (asset scan).
     DiskAssets,
     /// Texture gallery with previews.
@@ -35,16 +35,28 @@ pub enum View {
     Cvars,
     /// Raw deerpunk.toml text.
     Raw,
+    /// Launch profiles + scenarios editor (gear in the launch panel).
+    LaunchSettings,
     /// Live engine collection (entities, assets, players, …).
     Live(String),
 }
 
-/// Which document the Project view shows in the center.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectDoc {
-    Summary,
-    Toml,
-    GameInfo,
+/// A file opened in the main-zone tab strip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    /// Absolute path on disk.
+    pub path: PathBuf,
+    /// Display path relative to the project root.
+    pub rel: String,
+}
+
+/// Test scenario: extra engine CLI args, lighter than a launch profile.
+#[derive(Debug, Clone)]
+pub struct Scenario {
+    pub id: String,
+    pub label: String,
+    /// Extra engine args, e.g. ["--inspector-port", "9000"].
+    pub args: Vec<String>,
 }
 
 pub const REFRESH_OPTIONS: [u64; 5] = [0, 200, 250, 500, 1000];
@@ -93,9 +105,19 @@ pub struct StudioApp {
 
     // Layout state.
     pub active_view: View,
-    pub project_doc: ProjectDoc,
     pub cvars_category: Option<String>,
     pub selected_texture: Option<String>,
+
+    // Main-zone file tabs (file browser / asset viewer).
+    pub open_tabs: Vec<OpenFile>,
+    pub active_tab: Option<usize>,
+
+    // Launch scenarios (engine arg sets).
+    pub scenarios: Vec<Scenario>,
+    pub active_scenario: String,
+
+    // Game info modal (top bar icon click).
+    pub show_gameinfo_modal: bool,
 
     // Per-view UI state.
     pub assets_filter: String,
@@ -141,10 +163,18 @@ impl StudioApp {
             console: Stream::new(5000),
             input: String::new(),
             console_open: true,
-            active_view: View::Project,
-            project_doc: ProjectDoc::Summary,
+            active_view: View::Files,
             cvars_category: None,
             selected_texture: None,
+            open_tabs: Vec::new(),
+            active_tab: None,
+            scenarios: vec![Scenario {
+                id: "default".into(),
+                label: "Default".into(),
+                args: Vec::new(),
+            }],
+            active_scenario: "default".into(),
+            show_gameinfo_modal: false,
             assets_filter: String::new(),
             assets_kind: None,
             textures_filter: String::new(),
@@ -198,6 +228,12 @@ impl StudioApp {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "dev".into());
+                self.scenarios = load_scenarios(&root);
+                self.active_scenario = self
+                    .scenarios
+                    .first()
+                    .map(|s| s.id.clone())
+                    .unwrap_or_else(|| "default".into());
                 self.console = Stream::new(5000);
                 self.steps.clear();
                 self.connect();
@@ -303,12 +339,19 @@ impl StudioApp {
             .iter()
             .map(|n| Step { name: (*n).to_string(), state: StepState::Pending })
             .collect();
+        let scenario_args = self
+            .scenarios
+            .iter()
+            .find(|s| s.id == self.active_scenario)
+            .map(|s| s.args.clone())
+            .unwrap_or_default();
         self.runner.start(runner::InstancePlan {
             project_root: project.root.clone(),
             gamedir: project.gamedir.clone(),
             engine_dir: project.engine_dir.clone(),
             profile,
             gamelibs: project.gamelibs.clone(),
+            extra_args: scenario_args,
         });
     }
 
@@ -520,7 +563,7 @@ impl StudioApp {
     fn rail(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.add_space(6.0);
-            self.rail_button(ui, View::Project, ph::HOUSE, "Project");
+            self.rail_button(ui, View::Files, ph::FOLDER_SIMPLE, "File browser");
             self.rail_button(ui, View::DiskAssets, ph::HARD_DRIVES, "Disk assets");
             self.rail_button(ui, View::Textures, ph::IMAGE, "Textures");
             self.rail_button(ui, View::Cvars, ph::SLIDERS, "Cvars");
@@ -852,5 +895,42 @@ fn absolute(p: &std::path::Path) -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(p)
+    }
+}
+/// Load `.deerpunk/scenarios.toml` — `[scenario.<id>] label = "…"; args = […]`.
+/// Missing file yields the built-in empty `default` scenario.
+fn load_scenarios(project_root: &std::path::Path) -> Vec<Scenario> {
+    let fallback = || vec![Scenario {
+        id: "default".into(),
+        label: "Default".into(),
+        args: Vec::new(),
+    }];
+    let Ok(text) = std::fs::read_to_string(project_root.join(".deerpunk/scenarios.toml")) else {
+        return fallback();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return fallback();
+    };
+    let Some(table) = value.get("scenario").and_then(|v| v.as_table()) else {
+        return fallback();
+    };
+    let mut out = Vec::new();
+    for (id, value) in table {
+        let label = value.get("label").and_then(|v| v.as_str()).unwrap_or(id).to_string();
+        let args = value
+ .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(Scenario { id: id.clone(), label, args });
+    }
+    if out.is_empty() {
+        fallback()
+    } else {
+        out
     }
 }
