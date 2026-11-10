@@ -72,12 +72,17 @@ const fn c(hex: &str) -> Color32 {
         v = (v << 4) | hex_val(b[i]);
         i += 1;
     }
-    Color32::from_rgba_unmultiplied_const(
-        ((v >> 24) & 0xFF) as u8,
-        ((v >> 16) & 0xFF) as u8,
-        ((v >> 8) & 0xFF) as u8,
-        (v & 0xFF) as u8,
-    )
+    if b.len() == 9 {
+        Color32::from_rgba_unmultiplied_const(
+            ((v >> 24) & 0xFF) as u8,
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        )
+    } else {
+        // #RRGGBB: opaque — never treat the blue byte as alpha.
+        Color32::from_rgb(((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+    }
 }
 
 /// Soften bright near-neutral ANSI colors (white/gray) down to the console
@@ -95,6 +100,8 @@ pub fn console_soften(color: Color32) -> Color32 {
 
 /// Apply the Blender-inspired look: flat, sharp, dense.
 pub fn apply(ctx: &egui::Context) {
+    // Pin the theme: a light OS appearance must never flip panels back to white.
+    ctx.set_theme(egui::ThemePreference::Dark);
     ctx.all_styles_mut(|style| {
         let v = &mut style.visuals;
         *v = Visuals::dark();
@@ -184,4 +191,29 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
         .show(ui, |ui| {
             ui.label(mono_colored(text, color));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `#RRGGBB` constants must be fully opaque — a hex parser
+    /// bug once read the blue byte as alpha, making every fills ~11% opaque
+    /// and the whole UI look washed-out white.
+    #[test]
+    fn palette_colors_are_opaque() {
+        for (name, color) in [
+            ("BG", BG),
+            ("PANEL", PANEL),
+            ("HEADER", HEADER),
+            ("CARD", CARD),
+            ("FIELD", FIELD),
+            ("TEXT", TEXT),
+            ("ACCENT", ACCENT),
+            ("CONSOLE_TEXT", CONSOLE_TEXT),
+        ] {
+            assert_eq!(color.a(), 255, "{name} must be opaque");
+        }
+        assert_eq!(BG, Color32::from_rgb(0x1d, 0x1d, 0x1d));
+    }
 }

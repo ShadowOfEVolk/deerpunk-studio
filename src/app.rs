@@ -1,5 +1,5 @@
-//! Application state and layout: Blender-style workspace tab strip (Files /
-//! Inspector), docked central area, status bar with connection controls.
+//! Application shell: IDE-style layout — top toolbar, far-left view rail,
+//! resource sidebar, central content, bottom console panel, status bar.
 //! Live data comes from the engine inspector WS server (JSON-RPC over WS).
 
 use std::collections::HashMap;
@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui_dock::{DockArea, DockState, NodeIndex, TabViewer, TabStyle, TabBarStyle, Style as DockStyle};
 use serde_json::Value;
 
 use crate::ansi::Stream;
@@ -22,22 +21,29 @@ use crate::protocol::{self, CollectionDescriptor};
 use crate::runner::{self, Event as RunEvent, Runner, RunState, Step, StepState};
 use crate::theme;
 
+/// Top-level views, switched from the left rail (VS Code activity bar).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Tab {
+pub enum View {
+    /// deerpunk.toml + gameinfo summary/documents.
     Project,
-    Assets,
+    /// Files on disk (asset scan).
+    DiskAssets,
+    /// Texture gallery with previews.
     Textures,
+    /// cvars_catalog.json.
     Cvars,
+    /// Raw deerpunk.toml text.
     Raw,
-    Console,
-    Detail,
+    /// Live engine collection (entities, assets, players, …).
     Live(String),
 }
 
+/// Which document the Project view shows in the center.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Workspace {
-    Files,
-    Inspector,
+pub enum ProjectDoc {
+    Summary,
+    Toml,
+    GameInfo,
 }
 
 pub const REFRESH_OPTIONS: [u64; 5] = [0, 200, 250, 500, 1000];
@@ -72,7 +78,6 @@ pub struct StudioApp {
     pub lists: HashMap<String, Value>,
     pub selection: Option<Selection>,
     pub detail: Option<Value>,
-    pub console_lines: Vec<String>,
     pub inspector_built: bool,
 
     // Run instance state.
@@ -83,11 +88,15 @@ pub struct StudioApp {
     pub steps: Vec<Step>,
     pub console: Stream,
     pub input: String,
+    pub console_open: bool,
 
-    // Workspaces + per-panel UI state.
-    pub workspace: Workspace,
-    pub files_dock: DockState<Tab>,
-    pub inspector_dock: DockState<Tab>,
+    // Layout state.
+    pub active_view: View,
+    pub project_doc: ProjectDoc,
+    pub cvars_category: Option<String>,
+    pub selected_texture: Option<String>,
+
+    // Per-view UI state.
     pub assets_filter: String,
     pub assets_kind: Option<AssetKind>,
     pub textures_filter: String,
@@ -122,7 +131,6 @@ impl StudioApp {
             lists: HashMap::new(),
             selection: None,
             detail: None,
-            console_lines: Vec::new(),
             inspector_built: false,
             profiles: Profiles::default(),
             active_profile: "dev".into(),
@@ -131,9 +139,11 @@ impl StudioApp {
             steps: Vec::new(),
             console: Stream::new(5000),
             input: String::new(),
-            workspace: Workspace::Files,
-            files_dock: Self::build_files_dock(),
-            inspector_dock: Self::build_inspector_dock(&[]),
+            console_open: true,
+            active_view: View::Project,
+            project_doc: ProjectDoc::Summary,
+            cvars_category: None,
+            selected_texture: None,
             assets_filter: String::new(),
             assets_kind: None,
             textures_filter: String::new(),
@@ -157,37 +167,6 @@ impl StudioApp {
             app.run_instance();
         }
         app
-    }
-
-    /// Files workspace: file-based project panels; right leaf holds Console.
-    fn build_files_dock() -> DockState<Tab> {
-        let mut dock = DockState::new(vec![
-            Tab::Project,
-            Tab::Assets,
-            Tab::Textures,
-            Tab::Cvars,
-            Tab::Raw,
-        ]);
-        dock.main_surface_mut()
-            .split_right(NodeIndex::root(), 0.42, vec![Tab::Console]);
-        dock
-    }
-
-    /// Inspector workspace: collection lists left (42%), Detail + Console right.
-    fn build_inspector_dock(collections: &[CollectionDescriptor]) -> DockState<Tab> {
-        let left: Vec<Tab> = collections
-            .iter()
-            .map(|c| Tab::Live(c.id.clone()))
-            .collect();
-        let left = if left.is_empty() {
-            vec![Tab::Live("entities".into())]
-        } else {
-            left
-        };
-        let mut dock = DockState::new(left);
-        dock.main_surface_mut()
-            .split_right(NodeIndex::root(), 0.58, vec![Tab::Detail, Tab::Console]);
-        dock
     }
 
     /// Open a game project folder (must contain `deerpunk.toml`) and
@@ -421,8 +400,7 @@ impl StudioApp {
         };
         match incoming {
             protocol::Incoming::RpcError { id, code, message } => {
-                self.console_lines
-                    .push(format!("[rpc error {code}] {message}"));
+                self.console_lines_push(format!("[rpc error {code}] {message}"));
                 if let Some(id) = id {
                     self.pending.remove(&id);
                 }
@@ -439,19 +417,16 @@ impl StudioApp {
                                 serde_json::json!({}),
                             )));
                             self.collections = init.collections.clone();
-                            self.console_lines.push(format!(
+                            self.console_lines_push(format!(
                                 "[ws] {} v{} — {} collections",
                                 init.server,
                                 init.server_version.as_deref().unwrap_or("?"),
                                 init.collections.len()
                             ));
-                            if !self.inspector_built {
-                                self.inspector_dock = Self::build_inspector_dock(&self.collections);
-                                self.inspector_built = true;
-                            }
+                            self.inspector_built = true;
                             self.request_refresh();
                         }
-                        Err(e) => self.console_lines.push(format!("[ws] initialize parse: {e}")),
+                        Err(e) => self.console_lines_push(format!("[ws] initialize parse: {e}")),
                     }
                     return;
                 }
@@ -470,194 +445,230 @@ impl StudioApp {
         }
     }
 
+    /// Console lines that originate from the studio itself.
+    fn console_lines_push(&mut self, text: String) {
+        self.console.feed(format!("{text}\n").as_bytes());
+        self.dump_console(text.as_bytes());
+    }
+
     // ------------------------------------------------------------- layout
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let active = self.run_state != RunState::Idle;
-        let fill = if active { theme::BAR_ACTIVE } else { theme::HEADER };
-        egui::Frame::new()
-            .fill(fill)
-            .inner_margin(egui::Margin::symmetric(6, 3))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    self.workspace_tab(ui, Workspace::Files, "Files");
-                    self.workspace_tab(ui, Workspace::Inspector, "Inspector");
-                    ui.separator();
-                    if let Some(project) = &self.project {
-                        ui.weak(&project.name);
+        ui.horizontal(|ui| {
+            if let Some(project) = &self.project {
+                ui.label(
+                    egui::RichText::new(&project.name)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+            } else {
+                ui.label(theme::small("no project — Open…"));
+            }
+            ui.separator();
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-to-left order: Run/Stop, then profile, then file
+                // actions — so the profile dropdown sits left of Run.
+                if self.run_state == RunState::Idle {
+                    if ui.button("▶ Run").clicked() {
+                        self.run_instance();
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Right-to-left order: Run/Stop, then profile, then file
-                        // actions — so the profile dropdown sits left of Run.
-                        if self.run_state == RunState::Idle {
-                            if ui.button("▶ Run").clicked() {
-                                self.run_instance();
+                } else {
+                    if ui.button("■ Stop").clicked() {
+                        self.stop_instance();
+                    }
+                    ui.label(theme::small(run_state_label(&self.run_state)));
+                }
+                let profile_label = self
+                    .profiles
+                    .get(&self.active_profile)
+                    .map(|p| p.label.clone())
+                    .unwrap_or_else(|| self.active_profile.clone());
+                egui::ComboBox::from_id_salt("run_profile")
+                    .selected_text(profile_label)
+                    .show_ui(ui, |ui| {
+                        for id in self.profiles.order.clone() {
+                            let Some(p) = self.profiles.get(&id) else { continue };
+                            if ui
+                                .selectable_label(id == self.active_profile, &p.label)
+                                .clicked()
+                            {
+                                self.active_profile = id;
                             }
-                        } else {
-                            if ui.button("■ Stop").clicked() {
-                                self.stop_instance();
-                            }
-                            ui.label(theme::small(run_state_label(&self.run_state)));
-                        }
-                        let profile_label = self
-                            .profiles
-                            .get(&self.active_profile)
-                            .map(|p| p.label.clone())
-                            .unwrap_or_else(|| self.active_profile.clone());
-                        egui::ComboBox::from_id_salt("run_profile")
-                            .selected_text(profile_label)
-                            .show_ui(ui, |ui| {
-                                for id in self.profiles.order.clone() {
-                                    let Some(p) = self.profiles.get(&id) else { continue };
-                                    if ui.selectable_label(id == self.active_profile, &p.label).clicked() {
-                                        self.active_profile = id;
-                                    }
-                                }
-                            });
-                        if ui.button("Open…").clicked() {
-                            self.pick_folder();
-                        }
-                        if !self.cfg.recents.is_empty() {
-                            egui::ComboBox::from_id_salt("recents")
-                                .selected_text(theme::small("Recents"))
-                                .show_ui(ui, |ui| {
-                                    for recent in self.cfg.recents.clone() {
-                                        if ui.selectable_label(true, &recent).clicked() {
-                                            self.open_project(PathBuf::from(&recent));
-                                        }
-                                    }
-                                });
                         }
                     });
-                });
-            });
-        ui.separator();
-    }
-
-    /// Blender workspace tab: flat, active = lighter surface.
-    fn workspace_tab(&mut self, ui: &mut egui::Ui, ws: Workspace, label: &str) {
-        let active = self.workspace == ws;
-        let (bg, color) = if active {
-            (theme::FIELD, theme::TEXT)
-        } else {
-            (egui::Color32::TRANSPARENT, theme::TAB_INACTIVE)
-        };
-        let btn = egui::Button::new(egui::RichText::new(label).color(color).size(13.0))
-            .fill(bg)
-            .corner_radius(2.0)
-            .min_size(egui::vec2(0.0, 22.0));
-        if ui.add(btn).clicked() {
-            self.workspace = ws;
-        }
-    }
-
-    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .fill(theme::HEADER)
-            .inner_margin(egui::Margin::symmetric(8, 3))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    conn_badge(ui, &self.conn_state);
-                    if matches!(self.conn_state, ConnState::Connected | ConnState::Error(_)) {
-                        ui.label(theme::small(format!("{}:{}", self.host, self.port)));
-                    }
-                    if ui
-                        .add(egui::Button::new(theme::small("connect")).frame(false))
-                        .clicked()
-                    {
-                        self.connect();
-                    }
-                    if ui
-                        .add(egui::Button::new(theme::small("disconnect")).frame(false))
-                        .clicked()
-                    {
-                        self.disconnect();
-                    }
-                    egui::ComboBox::from_id_salt("refresh_ms")
-                        .selected_text(if self.refresh_ms == 0 {
-                            theme::small("manual")
-                        } else {
-                            theme::small(format!("{} ms", self.refresh_ms))
-                        })
+                if ui.button("Open…").clicked() {
+                    self.pick_folder();
+                }
+                if !self.cfg.recents.is_empty() {
+                    egui::ComboBox::from_id_salt("recents")
+                        .selected_text(theme::small("Recents"))
                         .show_ui(ui, |ui| {
-                            for opt in REFRESH_OPTIONS {
-                                let label = if opt == 0 {
-                                    "manual".to_string()
-                                } else {
-                                    format!("{opt} ms")
-                                };
-                                if ui.selectable_label(self.refresh_ms == opt, label).clicked() {
-                                    self.refresh_ms = opt;
+                            for recent in self.cfg.recents.clone() {
+                                if ui.selectable_label(true, &recent).clicked() {
+                                    self.open_project(PathBuf::from(&recent));
                                 }
                             }
                         });
-                    if ui
-                        .add(egui::Button::new(theme::small("refresh")).frame(false))
-                        .clicked()
-                    {
-                        self.request_refresh();
-                    }
-                    if ui
-                        .add(egui::Button::new(theme::small("reconnect")).frame(false))
-                        .clicked()
-                    {
-                        self.reconnect();
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(err) = &self.error {
-                            ui.label(
-                                egui::RichText::new(format!("⚠ {err}"))
-                                    .small()
-                                    .color(theme::YELLOW),
-                            );
-                        }
-                        if let (Some(scan), Some(project)) = (&self.scan, &self.project) {
-                            let bytes: u64 = scan.entries.iter().map(|e| e.size).sum();
-                            if !scan.errors.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(format!("{} walk errors", scan.errors.len()))
-                                        .small()
-                                        .color(theme::YELLOW),
-                                );
-                            }
-                            ui.label(theme::small(format!(
-                                "{} files · {} · gamedir {}",
-                                scan.entries.len(),
-                                assets::fmt_size(bytes),
-                                if project.gamedir_valid() { "ok" } else { "missing" }
-                            )));
-                        } else if self.scan_rx.is_some() {
-                            ui.label(theme::small("scanning…"));
-                        }
-                    });
-                });
+                }
             });
+        });
     }
 
-    fn dock_area(&mut self, ui: &mut egui::Ui) {
-        match self.workspace {
-            Workspace::Files => {
-                let mut dock =
-                    std::mem::replace(&mut self.files_dock, Self::build_files_dock());
-                let mut viewer = AppTabViewer { app: self };
-                DockArea::new(&mut dock)
-                    .style(dock_style(ui.style()))
-                    .show_inside(ui, &mut viewer);
-                self.files_dock = dock;
+    /// Far-left view rail (VS Code activity bar).
+    fn rail(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.add_space(6.0);
+            self.rail_button(ui, View::Project, "⌂", "Project");
+            self.rail_button(ui, View::DiskAssets, "▦", "Disk assets");
+            self.rail_button(ui, View::Textures, "▣", "Textures");
+            self.rail_button(ui, View::Cvars, "⚙", "Cvars");
+            self.rail_button(ui, View::Raw, "☰", "deerpunk.toml raw");
+
+            // Live collections (from the engine handshake).
+            if !self.collections.is_empty() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                let ids: Vec<String> = self.collections.iter().map(|c| c.id.clone()).collect();
+                for id in ids {
+                    let label = self
+                        .collections
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| c.label.clone())
+                        .unwrap_or_else(|| id.clone());
+                    let glyph = live_glyph(&id);
+                    self.rail_button(ui, View::Live(id.clone()), glyph, &label);
+                }
             }
-            Workspace::Inspector => {
-                let mut dock = std::mem::replace(
-                    &mut self.inspector_dock,
-                    Self::build_inspector_dock(&[]),
-                );
-                let mut viewer = AppTabViewer { app: self };
-                DockArea::new(&mut dock)
-                    .style(dock_style(ui.style()))
-                    .show_inside(ui, &mut viewer);
-                self.inspector_dock = dock;
-            }
+
+            // Bottom: console toggle.
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                let toggle = if self.console_open { "▾" } else { "▴" };
+                let btn = egui::Button::new(
+                    egui::RichText::new(toggle).color(theme::TEXT_DIM).size(14.0),
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .min_size(egui::vec2(36.0, 24.0));
+                if ui.add(btn).clicked() {
+                    self.console_open = !self.console_open;
+                }
+            });
+        });
+    }
+
+    fn rail_button(&mut self, ui: &mut egui::Ui, view: View, glyph: &str, tooltip: &str) {
+        let active = self.active_view == view;
+        let (fill, color) = if active {
+            (theme::FIELD, theme::TEXT)
+        } else {
+            (egui::Color32::TRANSPARENT, theme::TEXT_DIM)
+        };
+        let badge = match &view {
+            View::Live(id) => self
+                .lists
+                .get(id)
+                .map(|r| protocol::list_rows(r).len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let text = if badge > 0 {
+            egui::RichText::new(format!("{glyph}\n{badge}"))
+                .color(color)
+                .size(11.0)
+        } else {
+            egui::RichText::new(glyph).color(color).size(15.0)
+        };
+        let btn = egui::Button::new(text)
+            .fill(fill)
+            .corner_radius(4.0)
+            .min_size(egui::vec2(38.0, 30.0));
+        let resp = ui.add(btn);
+        if resp.clicked() {
+            self.active_view = view;
         }
+        resp.on_hover_text(tooltip);
+    }
+
+    /// Bottom status strip.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            conn_badge(ui, &self.conn_state);
+            if matches!(self.conn_state, ConnState::Connected | ConnState::Error(_)) {
+                ui.label(theme::small(format!("{}:{}", self.host, self.port)));
+            }
+            if ui
+                .add(egui::Button::new(theme::small("connect")).frame(false))
+                .clicked()
+            {
+                self.connect();
+            }
+            if ui
+                .add(egui::Button::new(theme::small("disconnect")).frame(false))
+                .clicked()
+            {
+                self.disconnect();
+            }
+            egui::ComboBox::from_id_salt("refresh_ms")
+                .selected_text(if self.refresh_ms == 0 {
+                    theme::small("manual")
+                } else {
+                    theme::small(format!("{} ms", self.refresh_ms))
+                })
+                .show_ui(ui, |ui| {
+                    for opt in REFRESH_OPTIONS {
+                        let label = if opt == 0 {
+                            "manual".to_string()
+                        } else {
+                            format!("{opt} ms")
+                        };
+                        if ui.selectable_label(self.refresh_ms == opt, label).clicked() {
+                            self.refresh_ms = opt;
+                        }
+                    }
+                });
+            if ui
+                .add(egui::Button::new(theme::small("refresh")).frame(false))
+                .clicked()
+            {
+                self.request_refresh();
+            }
+            if ui
+                .add(egui::Button::new(theme::small("reconnect")).frame(false))
+                .clicked()
+            {
+                self.reconnect();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(err) = &self.error {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {err}"))
+                            .small()
+                            .color(theme::YELLOW),
+                    );
+                }
+                if let (Some(scan), Some(project)) = (&self.scan, &self.project) {
+                    let bytes: u64 = scan.entries.iter().map(|e| e.size).sum();
+                    if !scan.errors.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{} walk errors", scan.errors.len()))
+                                .small()
+                                .color(theme::YELLOW),
+                        );
+                    }
+                    ui.label(theme::small(format!(
+                        "{} files · {} · gamedir {}",
+                        scan.entries.len(),
+                        assets::fmt_size(bytes),
+                        if project.gamedir_valid() { "ok" } else { "missing" }
+                    )));
+                } else if self.scan_rx.is_some() {
+                    ui.label(theme::small("scanning…"));
+                }
+            });
+        });
     }
 
     fn poll_scan(&mut self) {
@@ -693,41 +704,65 @@ impl eframe::App for StudioApp {
         self.poll_runner();
         self.handle_dropped_files(ui);
 
-        // eframe hands `App::ui` a transparent Ui over the OS clear color
-        // (light) — paint the Blender-style background over the whole window
-        // so no white shows through between panels.
-        ui.painter()
-            .rect_filled(ui.max_rect(), 0.0, theme::BG);
-
-        self.top_bar(ui);
-
+        // Paint the whole window first so no platform clear color leaks.
         let full = ui.available_rect_before_wrap();
-        let bottom_h = 24.0;
-        let central = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, full.max.y - bottom_h));
-        let bottom =
-            egui::Rect::from_min_max(egui::pos2(full.min.x, full.max.y - bottom_h), full.max);
+        ui.painter()
+            .rect_filled(full, 0.0, theme::BG);
 
-        {
-            let mut dock_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(central)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            self.dock_area(&mut dock_ui);
-        }
-        {
-            let mut bottom_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(bottom)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            self.bottom_bar(&mut bottom_ui);
+        egui::Panel::top("topbar")
+            .resizable(false)
+            .exact_size(30.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::HEADER)
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
+            )
+            .show(ui, |ui| self.top_bar(ui));
+
+        egui::Panel::left("rail")
+            .resizable(false)
+            .exact_size(48.0)
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(4, 2)))
+            .show(ui, |ui| self.rail(ui));
+
+        egui::Panel::left("sidebar")
+            .resizable(true)
+            .default_size(250.0)
+            .min_size(140.0)
+            .frame(egui::Frame::new().fill(theme::PANEL))
+            .show(ui, |ui| {
+                let view = self.active_view.clone();
+                panels::sidebar(ui, self, &view);
+            });
+
+        // Bottom panels: the first one shown lands at the very bottom edge —
+        // status bar first, console stacked above it.
+        egui::Panel::bottom("statusbar")
+            .resizable(false)
+            .exact_size(24.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::HEADER)
+                    .inner_margin(egui::Margin::symmetric(8, 1)),
+            )
+            .show(ui, |ui| self.status_bar(ui));
+
+        if self.console_open {
+            egui::Panel::bottom("console")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(80.0)
+                .frame(egui::Frame::new().fill(theme::BG))
+                .show(ui, |ui| panels::console_panel(ui, self));
         }
 
-        ui.allocate_rect(
-            egui::Rect::from_min_max(ui.min_rect().min, full.max),
-            egui::Sense::hover(),
-        );
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(10)))
+            .show(ui, |ui| {
+                let view = self.active_view.clone();
+                panels::center(ui, self, &view);
+            });
+
         if let Some(project) = &self.project {
             let title = self
                 .gameinfo
@@ -741,98 +776,6 @@ impl eframe::App for StudioApp {
     }
 }
 
-/// egui_dock chrome: flat Blender tab strip — inactive tabs sit on the header
-/// color, the active one merges into the editor surface below.
-fn dock_style(egui_style: &egui::Style) -> DockStyle {
-    // Derive from the applied (dark) egui style — the light `Style::default()`
-    // leaked light colors into dock buttons and drag overlays.
-    let mut style = DockStyle::from_egui(egui_style);
-    style.dock_area_padding = Some(egui::Margin::ZERO);
-    style.main_surface_border_stroke = egui::Stroke::NONE;
-
-    style.separator = egui_dock::SeparatorStyle {
-        width: 1.0,
-        color_idle: theme::BORDER_DARK,
-        color_hovered: theme::ACCENT,
-        color_dragged: theme::ACCENT,
-        ..Default::default()
-    };
-
-    style.tab_bar = TabBarStyle {
-        bg_fill: theme::HEADER,
-        height: 24.0,
-        inner_margin: egui::Margin::ZERO,
-        corner_radius: 0.0.into(),
-        hline_color: theme::BORDER_DARK,
-        ..Default::default()
-    };
-
-    style.tab = TabStyle {
-        active: tab_interaction(theme::PANEL, theme::TEXT),
-        inactive: tab_interaction(theme::HEADER, theme::TAB_INACTIVE),
-        focused: tab_interaction(theme::PANEL, theme::TEXT),
-        hovered: tab_interaction(theme::HOVER, theme::TEXT),
-        ..Default::default()
-    };
-    style
-}
-
-fn tab_interaction(bg: egui::Color32, text: egui::Color32) -> egui_dock::TabInteractionStyle {
-    egui_dock::TabInteractionStyle {
-        outline_color: egui::Color32::TRANSPARENT,
-        corner_radius: 0.0.into(),
-        bg_fill: bg,
-        text_color: text,
-    }
-}
-
-struct AppTabViewer<'a> {
-    app: &'a mut StudioApp,
-}
-
-impl<'a> TabViewer for AppTabViewer<'a> {
-    type Tab = Tab;
-
-    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
-        egui::Id::new(match tab {
-            Tab::Project => "tab_project",
-            Tab::Assets => "tab_assets",
-            Tab::Textures => "tab_textures",
-            Tab::Cvars => "tab_cvars",
-            Tab::Raw => "tab_raw",
-            Tab::Console => "tab_console",
-            Tab::Detail => "tab_detail",
-            Tab::Live(id) => return egui::Id::new(format!("tab_live_{id}")),
-        })
-    }
-
-    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        match tab {
-            Tab::Project => "Project".into(),
-            Tab::Assets => "Assets".into(),
-            Tab::Textures => "Textures".into(),
-            Tab::Cvars => "Cvars".into(),
-            Tab::Raw => "deerpunk.toml".into(),
-            Tab::Console => "Console".into(),
-            Tab::Detail => "Detail".into(),
-            Tab::Live(id) => {
-                let label = self
-                    .app
-                    .collections
-                    .iter()
-                    .find(|c| &c.id == id)
-                    .map(|c| c.label.clone())
-                    .unwrap_or_else(|| id.clone());
-                label.into()
-            }
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
-        panels::render(ui, tab, self.app);
-    }
-}
-
 fn run_state_label(state: &RunState) -> String {
     match state {
         RunState::Idle => "idle".into(),
@@ -840,6 +783,18 @@ fn run_state_label(state: &RunState) -> String {
         RunState::Running => "running".into(),
         RunState::Stopping => "stopping…".into(),
         RunState::Failed(e) => format!("failed: {e}"),
+    }
+}
+
+fn live_glyph(id: &str) -> &'static str {
+    match id {
+        "entities" => "◈",
+        "assets" => "◧",
+        "players" => "☻",
+        "systems" => "▤",
+        "fmod_events" => "♪",
+        "methoddb" => "≡",
+        _ => "◇",
     }
 }
 
