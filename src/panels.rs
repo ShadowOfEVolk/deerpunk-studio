@@ -39,6 +39,7 @@ pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
         View::Files => files_sidebar(ui, app),
         View::Cvars => cvars_sidebar(ui, app),
         View::LaunchSettings => launch_settings_sidebar(ui, app),
+        View::Puffin => puffin_sidebar(ui, app),
         View::Live(id) => collection_sidebar(ui, app, id),
     }
 }
@@ -49,6 +50,7 @@ pub fn center(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
         View::Files => files_center(ui, app),
         View::Cvars => cvars_center(ui, app),
         View::LaunchSettings => launch_settings_center(ui, app),
+        View::Puffin => puffin_center(ui, app),
         View::Live(_) => detail_panel(ui, app),
     }
 }
@@ -1288,4 +1290,50 @@ fn scalar_value(ui: &mut egui::Ui, v: &Value) {
         _ => (v.to_string(), theme::J_PUNCT),
     };
     ui.label(theme::mono_colored(text, color));
+}
+
+// -------------------------------------------------------------- puffin view
+
+fn puffin_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
+    sidebar_header(
+        ui,
+        "Puffin",
+        if app.puffin.is_some() { "live" } else { "offline" },
+    );
+    ui.label(theme::small("addr"));
+    ui.add(
+        egui::TextEdit::singleline(&mut app.puffin_addr)
+            .desired_width(ui.available_width() - 16.0),
+    );
+    ui.add_space(4.0);
+    match &app.puffin {
+        Some(_) => {
+            if ui.button("Disconnect").clicked() {
+                app.puffin = None;
+            }
+            ui.weak("flame graph renders in the center pane");
+        }
+        None => {
+            if ui.button("Connect").clicked() {
+                app.puffin = Some(crate::app::PuffinTab {
+                    client: puffin_http::Client::new(app.puffin_addr.clone()),
+                    profiler: puffin_egui::ProfilerUi::default(),
+                });
+            }
+            ui.weak("the game must run with the puffin feature (dev profile)");
+        }
+    }
+}
+
+fn puffin_center(ui: &mut egui::Ui, app: &mut StudioApp) {
+    let Some(tab) = app.puffin.as_mut() else {
+        ui.centered_and_justified(|ui| ui.weak("connect from the sidebar"));
+        return;
+    };
+    // puffin_viewer pattern: the client self-pumps frames; ProfilerUi
+    // renders straight from the client's frame view.
+    tab.profiler.ui(
+        ui,
+        &mut puffin_egui::MaybeMutRef::MutRef(&mut tab.client.frame_view()),
+    );
 }

@@ -32,6 +32,8 @@ pub enum View {
     Cvars,
     /// Launch profiles + scenarios editor (gear in the launch panel).
     LaunchSettings,
+    /// Puffin profiler (flame graph from the running game, :8585).
+    Puffin,
     /// Live engine collection (entities, assets, players, …).
     Live(String),
 }
@@ -52,6 +54,13 @@ pub struct Scenario {
     pub label: String,
     /// Extra engine args, e.g. ["--inspector-port", "9000"].
     pub args: Vec<String>,
+}
+
+/// Live Puffin profiler session: the HTTP client self-pumps frames from the
+/// game's puffin server; `ProfilerUi` renders the flame graph.
+pub struct PuffinTab {
+    pub client: puffin_http::Client,
+    pub profiler: puffin_egui::ProfilerUi,
 }
 
 /// Game icon bytes, read and decode-checked once per project. Fed to egui
@@ -108,6 +117,10 @@ pub struct StudioApp {
     pub console: Stream,
     pub input: String,
     pub console_open: bool,
+
+    // Puffin profiler connection (View::Puffin).
+    pub puffin: Option<PuffinTab>,
+    pub puffin_addr: String,
 
     // Layout state.
     pub active_view: View,
@@ -171,6 +184,8 @@ impl StudioApp {
             console: Stream::new(5000),
             input: String::new(),
             console_open: true,
+            puffin: None,
+            puffin_addr: "127.0.0.1:8585".into(),
             active_view: View::Files,
             cvars_category: None,
             open_tabs: Vec::new(),
@@ -873,6 +888,7 @@ impl StudioApp {
             ui.add_space(6.0);
             self.rail_button(ui, View::Files, ph::FOLDER_SIMPLE, "File browser");
             self.rail_button(ui, View::Cvars, ph::SLIDERS, "Cvars");
+            self.rail_button(ui, View::Puffin, ph::FIRE, "Puffin profiler");
 
             // Live collections (from the engine handshake).
             if !self.collections.is_empty() {

@@ -10,6 +10,8 @@ egui-phosphor = "0.14"
 egui_extras = { version = "0.36", features = ["file", "image", "svg"] }
 image = "0.25.10"
 libc = "0.2.191"
+puffin_http = "0.17"
+puffin_egui = { path = "third_party/puffin_egui" }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

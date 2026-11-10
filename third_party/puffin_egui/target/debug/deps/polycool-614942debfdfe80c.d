@@ -1,0 +1,10 @@
+/Users/theevolk/dev/gamedev/deerpunk-studio/third_party/puffin_egui/target/debug/deps/polycool-614942debfdfe80c.d: /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs
+
+/Users/theevolk/dev/gamedev/deerpunk-studio/third_party/puffin_egui/target/debug/deps/libpolycool-614942debfdfe80c.rmeta: /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs /Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs
+
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs:
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs:
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs:
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs:
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs:
+/Users/theevolk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs:

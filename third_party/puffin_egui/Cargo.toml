@@ -1,0 +1,29 @@
+# Vendored from puffin_egui 0.30.0 (EmbarkStudios/puffin, MIT OR Apache-2.0)
+# Ported to egui 0.36.2. Temporary [workspace] table below lets the crate
+# build standalone; remove it when absorbed by a parent workspace.
+[package]
+name = "puffin_egui"
+version = "0.30.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Show puffin profiler flamegraph in-game using egui (vendored, egui 0.36 port)"
+repository = "https://github.com/EmbarkStudios/puffin"
+
+[dependencies]
+egui = { version = "0.36.2", default-features = false }
+egui_extras = { version = "0.36.2", default-features = false, features = ["serde"] }
+indexmap = { version = "2.13", features = ["serde"] }
+log = "0.4"
+log-once = "0.4"
+natord = "1.0.9"
+parking_lot = "0.12"
+puffin = { version = "0.20", features = ["packing"] }
+serde = { version = "1.0", features = ["derive", "rc"], optional = true }
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
+vec1 = "1.12"
+web-time = "1.1"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "egui/serde", "puffin/serde"]
+
