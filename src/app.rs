@@ -607,11 +607,13 @@ impl StudioApp {
             .as_ref()
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "no project".into());
+        // Plain label look: no button chrome (fill AND stroke off), font
+        // larger than every other control in the bar — it's the game logo.
         let name_resp = ui.add(
             egui::Button::new(
                 egui::RichText::new(name)
                     .strong()
-                    .size(17.0)
+                    .size(21.0)
                     .color(if has_project {
                         theme::TEXT
                     } else {
@@ -619,6 +621,7 @@ impl StudioApp {
                     }),
             )
             .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
             .truncate(),
         );
         if resp.clicked() || name_resp.clicked() {
