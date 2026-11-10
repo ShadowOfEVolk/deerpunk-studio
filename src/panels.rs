@@ -37,10 +37,7 @@ const IMAGE_VIEWER_EXTS: [&str; 3] = ["png", "jpg", "jpeg"];
 pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
     match view {
         View::Files => files_sidebar(ui, app),
-        View::DiskAssets => assets_sidebar(ui, app),
-        View::Textures => textures_sidebar(ui, app),
         View::Cvars => cvars_sidebar(ui, app),
-        View::Raw => raw_sidebar(ui),
         View::LaunchSettings => launch_settings_sidebar(ui, app),
         View::Live(id) => collection_sidebar(ui, app, id),
     }
@@ -50,10 +47,7 @@ pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
 pub fn center(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
     match view {
         View::Files => files_center(ui, app),
-        View::DiskAssets => assets_center(ui, app),
-        View::Textures => textures_center(ui, app),
         View::Cvars => cvars_center(ui, app),
-        View::Raw => raw_center(ui, app),
         View::LaunchSettings => launch_settings_center(ui, app),
         View::Live(_) => detail_panel(ui, app),
     }
@@ -241,8 +235,9 @@ fn file_glyph(name: &str) -> &'static str {
 fn tree_row(
     ui: &mut egui::Ui,
     indent: f32,
+    glyph: &str,
     selected: bool,
-    label: &str,
+    name: &str,
     color: egui::Color32,
 ) -> egui::Response {
     let (rect, resp) =
@@ -257,16 +252,22 @@ fn tree_row(
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
+    // Fixed columns: glyph centered in a 16px icon column, name at a stable
+    // x — mixing them into one string made names wobble with glyph widths.
+    let icon_col = rect.left() + indent;
     ui.painter().text(
-        egui::pos2(rect.left() + indent, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
+        egui::pos2(icon_col + 8.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        glyph,
         egui::FontId::proportional(13.0),
-        if selected {
-            egui::Color32::WHITE
-        } else {
-            color
-        },
+        if selected { egui::Color32::WHITE } else { theme::TEXT_DIM },
+    );
+    ui.painter().text(
+        egui::pos2(icon_col + 17.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::proportional(13.0),
+        if selected { egui::Color32::WHITE } else { color },
     );
     resp
 }
@@ -292,9 +293,8 @@ fn render_tree_node(
         } else {
             ph::FOLDER_SIMPLE
         };
-        let label = format!("{glyph} {}", node.name);
         let mut open = state.is_open();
-        if tree_row(ui, indent, false, &label, selected_text_color(false)).clicked() {
+        if tree_row(ui, indent, glyph, false, &node.name, selected_text_color(false)).clicked() {
             open = !open;
         }
         if open != state.is_open() {
@@ -309,8 +309,16 @@ fn render_tree_node(
     } else {
         let abs = root.join(&node.rel);
         let selected = active_path == Some(abs.as_path());
-        let label = format!("{} {}", file_glyph(&node.name), node.name);
-        if tree_row(ui, indent, selected, &label, selected_text_color(selected)).clicked() {
+        if tree_row(
+            ui,
+            indent,
+            file_glyph(&node.name),
+            selected,
+            &node.name,
+            selected_text_color(selected),
+        )
+        .clicked()
+        {
             open_file_tab(app, abs, node.rel.clone());
         }
     }
@@ -533,7 +541,10 @@ fn text_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
             ),
         );
     }
-    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+    egui::ScrollArea::both()
+        .id_salt(format!("text_viewer_{}", tab.path.display()))
+        .auto_shrink(false)
+        .show(ui, |ui| {
         ui.add(
             egui::Label::new(theme::mono_text(&cached.content))
                 .wrap_mode(egui::TextWrapMode::Extend),
@@ -544,7 +555,10 @@ fn text_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
 fn image_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
     let size = std::fs::metadata(&tab.path).map(|m| m.len()).unwrap_or(0);
     let uri = format!("file://{}", tab.path.display());
-    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+    egui::ScrollArea::both()
+        .id_salt(format!("image_viewer_{}", tab.path.display()))
+        .auto_shrink(false)
+        .show(ui, |ui| {
         ui.add_space(4.0);
         // Show at native size, downscaled only when larger than the pane —
         // `max_size` alone would blow 16px icons up to the full area.
@@ -846,156 +860,6 @@ fn selected_text_color(selected: bool) -> egui::Color32 {
     }
 }
 
-// -------------------------------------------------------------- assets view
-
-fn assets_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let total = app.scan.as_ref().map(|s| s.entries.len()).unwrap_or(0);
-    sidebar_header(ui, "Disk assets", format!("{total} files"));
-    filter_box(ui, &mut app.assets_filter, "filter by path…");
-    ui.add_space(4.0);
-    let current_kind = app.assets_kind;
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            let mut row = |ui: &mut egui::Ui, k: Option<AssetKind>, label: &str, count: usize| {
-                let selected = app.assets_kind == k;
-                let text = egui::RichText::new(format!("{label}  {count}"))
-                    .color(selected_text_color(selected));
-                if sidebar_row(ui, selected, text).clicked() {
-                    app.assets_kind = k;
-                }
-            };
-            row(ui, None, "All", total);
-            for kind in &crate::app::KINDS {
-                let count = app
-                    .scan
-                    .as_ref()
-                    .map(|s| s.entries.iter().filter(|e| e.kind == *kind).count())
-                    .unwrap_or(0);
-                if count > 0 || current_kind == Some(*kind) {
-                    row(ui, Some(*kind), kind.label(), count);
-                }
-            }
-        });
-}
-
-fn assets_center(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let Some(scan) = &app.scan else {
-        ui.centered_and_justified(|ui| {
-            ui.weak(if app.scan_rx.is_some() {
-                "scanning…"
-            } else {
-                "no project open"
-            });
-        });
-        return;
-    };
-
-    let filter = app.assets_filter.to_lowercase();
-    let kind = app.assets_kind;
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            egui::Grid::new("assets_table")
-                .striped(true)
-                .num_columns(4)
-                .spacing([12.0, 2.0])
-                .show(ui, |ui| {
-                    for entry in &scan.entries {
-                        let path = entry.rel.display().to_string();
-                        if !filter.is_empty() && !path.to_lowercase().contains(&filter) {
-                            continue;
-                        }
-                        if let Some(k) = kind {
-                            if entry.kind != k {
-                                continue;
-                            }
-                        }
-                        let name = entry
-                            .rel
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default();
-                        let dir = entry
-                            .rel
-                            .parent()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        ui.monospace(name);
-                        ui.weak(dir);
-                        ui.weak(entry.kind.label());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.weak(crate::assets::fmt_size(entry.size));
-                        });
-                        ui.end_row();
-                    }
-                });
-        });
-}
-
-// ----------------------------------------------------------- textures view
-
-fn textures_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let count = app
-        .scan
-        .as_ref()
-        .map(|s| {
-            s.entries
-                .iter()
-                .filter(|e| e.kind == AssetKind::Texture)
-                .count()
-        })
-        .unwrap_or(0);
-    sidebar_header(ui, "Textures", format!("{count}"));
-    filter_box(ui, &mut app.textures_filter, "filter textures…");
-    ui.add_space(4.0);
-    let Some(scan) = app.scan.clone() else {
-        return;
-    };
-    let filter = app.textures_filter.to_lowercase();
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            for entry in &scan.entries {
-                if entry.kind != AssetKind::Texture {
-                    continue;
-                }
-                let path = entry.rel.display().to_string();
-                if !filter.is_empty() && !path.to_lowercase().contains(&filter) {
-                    continue;
-                }
-                let name = entry.rel.display().to_string();
-                let selected = app.selected_texture.as_deref() == Some(name.as_str());
-                let label_text = name.clone();
-                if sidebar_row(
-                    ui,
-                    selected,
-                    egui::RichText::new(label_text).color(selected_text_color(selected)),
-                )
-                .clicked()
-                {
-                    app.selected_texture = Some(name);
-                }
-            }
-        });
-}
-
-fn textures_center(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let Some(selected) = app.selected_texture.clone() else {
-        ui.centered_and_justified(|ui| ui.weak("select a texture in the sidebar"));
-        return;
-    };
-    let Some(project) = app.project.clone() else {
-        return;
-    };
-    let abs = project.gamedir.join(&selected);
-    let uri = format!("file://{}", abs.display());
-    ui.heading(&selected);
-    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-        ui.add_space(8.0);
-        ui.add(egui::Image::new(egui::ImageSource::Uri(uri.into())).max_size(ui.available_size()));
-    });
-}
 
 // -------------------------------------------------------------- cvars view
 
@@ -1105,25 +969,6 @@ fn cvars_center(ui: &mut egui::Ui, app: &mut StudioApp) {
                         ui.end_row();
                     }
                 });
-        });
-}
-
-// ---------------------------------------------------------------- raw view
-
-fn raw_sidebar(ui: &mut egui::Ui) {
-    sidebar_header(ui, "deerpunk.toml", "raw");
-    ui.weak("raw file contents");
-}
-
-fn raw_center(ui: &mut egui::Ui, app: &mut StudioApp) {
-    let Some(project) = &app.project else {
-        ui.centered_and_justified(|ui| ui.weak("no project open"));
-        return;
-    };
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            ui.monospace(&project.raw);
         });
 }
 

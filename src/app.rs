@@ -11,7 +11,7 @@ use eframe::egui;
 use serde_json::Value;
 
 use crate::ansi::Stream;
-use crate::assets::{self, AssetKind, ScanResult};
+use crate::assets::{self, ScanResult};
 use crate::config::StudioConfig;
 use crate::gameinfo::GameInfo;
 use crate::net::{ConnState, NetClient, NetCmd, NetEvent};
@@ -26,16 +26,10 @@ use egui_phosphor::variants::regular as ph;
 /// Top-level views, switched from the left rail (VS Code activity bar).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum View {
-    /// Hierarchical file browser (project root + gamedir).
+    /// Hierarchical file browser (project root + gamedir) + asset viewers.
     Files,
-    /// Files on disk (asset scan).
-    DiskAssets,
-    /// Texture gallery with previews.
-    Textures,
     /// cvars_catalog.json.
     Cvars,
-    /// Raw deerpunk.toml text.
-    Raw,
     /// Launch profiles + scenarios editor (gear in the launch panel).
     LaunchSettings,
     /// Live engine collection (entities, assets, players, …).
@@ -118,7 +112,6 @@ pub struct StudioApp {
     // Layout state.
     pub active_view: View,
     pub cvars_category: Option<String>,
-    pub selected_texture: Option<String>,
 
     // Main-zone file tabs (file browser / asset viewer).
     pub open_tabs: Vec<OpenFile>,
@@ -136,9 +129,6 @@ pub struct StudioApp {
     pub game_icon: Option<GameIcon>,
 
     // Per-view UI state.
-    pub assets_filter: String,
-    pub assets_kind: Option<AssetKind>,
-    pub textures_filter: String,
     pub cvars_filter: String,
     pub filters: HashMap<String, String>,
 }
@@ -183,7 +173,6 @@ impl StudioApp {
             console_open: true,
             active_view: View::Files,
             cvars_category: None,
-            selected_texture: None,
             open_tabs: Vec::new(),
             active_tab: None,
             scenarios: vec![Scenario {
@@ -195,9 +184,6 @@ impl StudioApp {
             show_gameinfo_modal: false,
             last_recents: Vec::new(),
             game_icon: None,
-            assets_filter: String::new(),
-            assets_kind: None,
-            textures_filter: String::new(),
             cvars_filter: String::new(),
             filters: HashMap::new(),
         };
@@ -659,8 +645,16 @@ impl StudioApp {
 
         let running = self.run_state != RunState::Idle;
         let enabled = self.project.is_some();
+        // The play slot doubles as the run-state indicator: spinner while
+        // building/stopping, pulse while running, warning on failure. Click
+        // always stops while a run is active.
         let (glyph, tint) = if running {
-            (ph::STOP, theme::RED)
+            match &self.run_state {
+                RunState::Building | RunState::Stopping => (ph::CIRCLE_NOTCH, theme::YELLOW),
+                RunState::Running => (ph::PULSE, theme::GREEN),
+                RunState::Failed(_) => (ph::WARNING, theme::RED),
+                RunState::Idle => (ph::STOP, theme::RED),
+            }
         } else {
             (ph::PLAY, theme::ACCENT)
         };
@@ -804,18 +798,6 @@ impl StudioApp {
             }
         });
 
-        // Run status next to the button: state icon + dim label.
-        if running {
-            let (icon, color) = match &self.run_state {
-                RunState::Building => (ph::CIRCLE_NOTCH, theme::YELLOW),
-                RunState::Running => (ph::PULSE, theme::GREEN),
-                RunState::Stopping => (ph::CIRCLE_NOTCH, theme::YELLOW),
-                RunState::Failed(_) => (ph::WARNING, theme::RED),
-                RunState::Idle => (ph::PULSE, theme::MUTED),
-            };
-            ui.label(egui::RichText::new(icon).size(15.0).color(color));
-            ui.label(theme::small(run_state_label(&self.run_state)).color(theme::TEXT_DIM));
-        }
 
         ui.separator();
         connect_dot(ui, &self.conn_state);
@@ -890,10 +872,7 @@ impl StudioApp {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.add_space(6.0);
             self.rail_button(ui, View::Files, ph::FOLDER_SIMPLE, "File browser");
-            self.rail_button(ui, View::DiskAssets, ph::HARD_DRIVES, "Disk assets");
-            self.rail_button(ui, View::Textures, ph::IMAGE, "Textures");
             self.rail_button(ui, View::Cvars, ph::SLIDERS, "Cvars");
-            self.rail_button(ui, View::Raw, ph::FILE_TEXT, "deerpunk.toml raw");
 
             // Live collections (from the engine handshake).
             if !self.collections.is_empty() {
@@ -1176,16 +1155,6 @@ impl eframe::App for StudioApp {
     }
 }
 
-fn run_state_label(state: &RunState) -> String {
-    match state {
-        RunState::Idle => "idle".into(),
-        RunState::Building => "building…".into(),
-        RunState::Running => "running".into(),
-        RunState::Stopping => "stopping…".into(),
-        RunState::Failed(e) => format!("failed: {e}"),
-    }
-}
-
 fn live_glyph(id: &str) -> &'static str {
     match id {
         "entities" => ph::CUBE,
@@ -1273,26 +1242,6 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
     });
 }
 
-pub const KINDS: [AssetKind; 18] = [
-    AssetKind::GameInfo,
-    AssetKind::StartupScript,
-    AssetKind::Texture,
-    AssetKind::Material,
-    AssetKind::Shader,
-    AssetKind::Prefab,
-    AssetKind::Entity,
-    AssetKind::Config,
-    AssetKind::Map,
-    AssetKind::MapRegion,
-    AssetKind::DataPack,
-    AssetKind::Sound,
-    AssetKind::Ui,
-    AssetKind::Font,
-    AssetKind::Binary,
-    AssetKind::Log,
-    AssetKind::Doc,
-    AssetKind::Other,
-];
 
 fn absolute(p: &std::path::Path) -> PathBuf {
     if p.is_absolute() {
