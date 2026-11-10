@@ -120,6 +120,10 @@ pub struct StudioApp {
     pub last_fetch: HashMap<String, Instant>,
     pub selection: Option<Selection>,
     pub detail: Option<Value>,
+    /// PrefabId → classname, built from the `prefabs` collection (the
+    /// prefabMap). Fetched once after initialize, refreshed lazily with the
+    /// active view; entity names resolve through it without opening its tab.
+    pub prefab_map: HashMap<u32, String>,
     /// Prefab → decoded icon texture (None = known missing/no icon), so each
     /// prefab file is parsed and uploaded once per session.
     pub prefab_icons: HashMap<String, Option<egui::TextureHandle>>,
@@ -216,6 +220,7 @@ impl StudioApp {
             collections: Vec::new(),
             lists: HashMap::new(),
             last_fetch: HashMap::new(),
+            prefab_map: HashMap::new(),
             selection: None,
             detail: None,
             prefab_icons: HashMap::new(),
@@ -354,6 +359,7 @@ impl StudioApp {
         self.collections.clear();
         self.lists.clear();
         self.last_fetch.clear();
+        self.prefab_map.clear();
         self.inspector_built = false;
         self.net.cmd(NetCmd::Connect { host, port });
     }
@@ -412,6 +418,32 @@ impl StudioApp {
         }
     }
 
+    /// Any entity collection from the handshake (new contract: their rows
+    /// carry `prefabId` and the `prefabs` collection is the name map).
+    fn has_entity_collections(&self) -> bool {
+        self.collections
+            .iter()
+            .any(|c| c.id == "serverentities" || c.id == "cliententities")
+    }
+
+    /// Fetch the `prefabs` collection when entity collections exist and the
+    /// cached map is missing or older than the refresh interval. Cheap: the
+    /// map is a handful of rows.
+    fn ensure_prefab_map(&mut self) {
+        if self.conn_state != ConnState::Connected || !self.has_entity_collections() {
+            return;
+        }
+        let stale = match self.last_fetch.get("prefabs") {
+            None => true,
+            Some(t) => self.refresh_ms > 0 && t.elapsed() >= Duration::from_millis(self.refresh_ms),
+        };
+        if stale {
+            self.rpc("prefabs.list", serde_json::json!({}));
+            self.last_fetch
+                .insert("prefabs".to_string(), Instant::now());
+        }
+    }
+
     /// Fetch the active view's collection list (if it is a list-mode
     /// collection) and the active selection's detail.
     pub fn request_refresh(&mut self) {
@@ -419,6 +451,7 @@ impl StudioApp {
             return;
         }
         self.last_refresh = Instant::now();
+        self.ensure_prefab_map();
         let Some(id) = self.active_collection().map(str::to_string) else {
             return;
         };
@@ -625,6 +658,7 @@ impl StudioApp {
                             ));
                             self.inspector_built = true;
                             self.ensure_active_list();
+                            self.ensure_prefab_map();
                         }
                         Err(e) => self.console_lines_push(format!("[ws] initialize parse: {e}")),
                     }
@@ -633,7 +667,13 @@ impl StudioApp {
                 if let Some((col_id, action)) = method.rsplit_once('.') {
                     match action {
                         "list" => {
-                            self.lists.insert(col_id.to_string(), result);
+                            self.lists.insert(col_id.to_string(), result.clone());
+                            if col_id == "prefabs" {
+                                self.prefab_map = protocol::list_rows(&result)
+                                    .iter()
+                                    .filter_map(protocol::prefab_row)
+                                    .collect();
+                            }
                         }
                         "get" => {
                             self.detail = Some(result);
@@ -1018,7 +1058,15 @@ impl StudioApp {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(2.0);
-                let ids: Vec<String> = self.collections.iter().map(|c| c.id.clone()).collect();
+                // The `prefabs` collection is the prefabId→classname map used
+                // by entity views; it is fetched in the background and has no
+                // rail tab of its own.
+                let ids: Vec<String> = self
+                    .collections
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .filter(|id| id != "prefabs")
+                    .collect();
                 for id in ids {
                     let label = self
                         .collections

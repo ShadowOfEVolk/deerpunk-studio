@@ -1143,10 +1143,20 @@ fn collection_sidebar(ui: &mut egui::Ui, app: &mut StudioApp, id: &str) {
                 let name = row.get("name").and_then(Value::as_str).unwrap_or("");
                 let row_index = row.get(id_field.as_str()).map(protocol::cell);
                 let index_str = row_index.clone().unwrap_or_default();
+                let prefab_id = protocol::row_prefab_id(row);
                 let prefab = protocol::row_prefab(row);
                 let position = protocol::row_position(row);
+                // Display name and icon both key off the CLASSNAME: the
+                // prefabMap resolves prefabId, with the legacy string `prefab`
+                // and the raw entity `name` as fallbacks.
+                let classname = prefab_id
+                    .and_then(|id| app.prefab_map.get(&id).cloned())
+                    .or(prefab.clone());
+                let display_name = classname
+                    .clone()
+                    .unwrap_or_else(|| name_or_first(name, &first));
                 if !filter.is_empty()
-                    && !format!("{first} {name} {}", prefab.as_deref().unwrap_or(""))
+                    && !format!("{first} {name} {display_name}")
                         .to_lowercase()
                         .contains(&filter)
                 {
@@ -1157,16 +1167,13 @@ fn collection_sidebar(ui: &mut egui::Ui, app: &mut StudioApp, id: &str) {
                     .as_ref()
                     .map(|s| s.col == id && s.index_str == index_str)
                     .unwrap_or(false);
-                let display_name = prefab
-                    .clone()
-                    .unwrap_or_else(|| name_or_first(name, &first));
-                let resp = if prefab.is_some() || position.is_some() {
+                let resp = if classname.is_some() || position.is_some() {
                     entity_row(
                         ui,
                         app,
                         selected,
                         &display_name,
-                        prefab.as_deref(),
+                        classname.as_deref(),
                         position.as_ref(),
                     )
                 } else {
@@ -1208,7 +1215,12 @@ pub fn detail_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("●").size(10.0).color(theme::GREEN));
             ui.strong(theme::mono_text(&entity.name));
-            if let Some(prefab) = &entity.prefab {
+            // Classname: prefabMap by prefabId, else the legacy string.
+            let classname = entity
+                .prefab_id
+                .and_then(|id| app.prefab_map.get(&id).cloned())
+                .or_else(|| entity.prefab.clone());
+            if let Some(prefab) = classname {
                 ui.weak(format!("· {prefab}"));
             }
             ui.weak(format!("#{}", entity.index));
@@ -1240,6 +1252,9 @@ fn component_card(ui: &mut egui::Ui, comp: &ComponentSnapshot) {
                 ui.weak("tag");
             });
         }
+        ComponentSnapshot::Data { slug, data, .. } if is_unregistered(data) => {
+            unregistered_card(ui, slug);
+        }
         ComponentSnapshot::Data { slug, data, .. } => {
             egui::Frame::new()
                 .fill(theme::CARD)
@@ -1255,7 +1270,34 @@ fn component_card(ui: &mut egui::Ui, comp: &ComponentSnapshot) {
                         });
                 });
         }
+        ComponentSnapshot::Unregistered { .. } => {
+            unregistered_card(ui, comp.slug());
+        }
     }
+}
+
+/// True when the engine marked a component as having no registered inspect
+/// properties (`{"_unregistered": true}`, possibly nested inside `data`).
+fn is_unregistered(data: &Value) -> bool {
+    data.as_object()
+        .is_some_and(|o| o.len() == 1 && o.get("_unregistered") == Some(&Value::Bool(true)))
+}
+
+/// Muted card for components without registered properties.
+fn unregistered_card(ui: &mut egui::Ui, slug: &str) {
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(egui::Stroke::new(1.0, theme::CARD_BORDER))
+        .corner_radius(8.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            egui::CollapsingHeader::new(theme::mono_text(slug).color(theme::TEXT_DIM))
+                .id_salt(format!("comp_unreg_{slug}"))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.weak("no properties registered");
+                });
+        });
 }
 
 // ----------------------------------------------------------------- console

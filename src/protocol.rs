@@ -61,20 +61,72 @@ pub enum ComponentSnapshot {
         schema: Option<Value>,
         data: Value,
     },
+    /// Unregistered component: the server sends `{"slug": …,
+    /// "_unregistered": true}` (no properties). Rendered as a muted card.
+    /// Placed last: untagged matching must not swallow Data payloads.
+    Unregistered {
+        #[serde(default)]
+        slug: Option<String>,
+    },
+}
+
+impl ComponentSnapshot {
+    /// Component name for card titles (slug may be absent on odd payloads).
+    pub fn slug(&self) -> &str {
+        match self {
+            ComponentSnapshot::Tag { slug, .. } => slug,
+            ComponentSnapshot::Data { slug, .. } => slug,
+            ComponentSnapshot::Unregistered { slug } => slug.as_deref().unwrap_or("(unregistered)"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EntityGetResult {
     pub index: u64,
     pub name: String,
-    /// Prefab classname from the network-entity component (optional).
+    /// Prefab classname from the network-entity component (optional, legacy
+    /// contract; newer hosts send `prefabId` + a `prefabs` collection).
     #[serde(default)]
     pub prefab: Option<String>,
+    #[serde(rename = "prefabId", default)]
+    pub prefab_id: Option<u32>,
     #[serde(default)]
     pub components: Vec<ComponentSnapshot>,
 }
 
-/// Optional `prefab` key on a list row (absent on older inspector hosts).
+/// Row of the `prefabs` collection (the prefabMap): `{"id": u32,
+/// "classname": "…"}`.
+pub fn prefab_row(row: &Value) -> Option<(u32, String)> {
+    let id = row.get("id").and_then(Value::as_u64)? as u32;
+    let classname = row.get("classname").and_then(Value::as_str)?;
+    Some((id, classname.to_string()))
+}
+
+/// Display name for an entity: prefabMap classname for `prefabId`, else the
+/// legacy string `prefab`, else the raw entity `name`.
+pub fn resolve_entity_name(
+    prefab_id: Option<u32>,
+    prefab: Option<&str>,
+    name: &str,
+    map: &std::collections::HashMap<u32, String>,
+) -> String {
+    prefab_id
+        .and_then(|id| map.get(&id))
+        .cloned()
+        .or_else(|| prefab.map(str::to_string))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Optional `prefabId` key on a list row (new contract; older hosts send the
+/// string `prefab` instead — support both on receive).
+pub fn row_prefab_id(row: &Value) -> Option<u32> {
+    row.get("prefabId")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+}
+
+/// Optional `prefab` string key on a list row (legacy contract).
 pub fn row_prefab(row: &Value) -> Option<String> {
     row.get("prefab")
         .and_then(Value::as_str)
@@ -264,6 +316,64 @@ mod tests {
         assert_eq!(row_position(&bad), None);
         let empty_prefab = json!({"index": 4, "name": "x", "prefab": ""});
         assert_eq!(row_prefab(&empty_prefab), None);
+    }
+
+    #[test]
+    fn entity_row_prefab_id_key() {
+        let row = json!({"index": 1, "name": "mob", "prefabId": 7});
+        assert_eq!(row_prefab_id(&row), Some(7));
+        assert_eq!(row_prefab(&row), None);
+        assert_eq!(row_prefab_id(&json!({"index": 2, "name": "x"})), None);
+    }
+
+    #[test]
+    fn prefab_map_rows_parse() {
+        let rows = list_rows(&json!({"time": 0.0, "count": 2, "prefabs": [
+            {"id": 1, "classname": "player"},
+            {"id": 2, "classname": "item_drop"}
+        ]}));
+        let map: std::collections::HashMap<u32, String> =
+            rows.iter().filter_map(prefab_row).collect();
+        assert_eq!(map.get(&1).map(String::as_str), Some("player"));
+        assert_eq!(map.get(&2).map(String::as_str), Some("item_drop"));
+        assert!(prefab_row(&json!({"id": 3})).is_none());
+        assert!(prefab_row(&json!({"classname": "x"})).is_none());
+    }
+
+    #[test]
+    fn resolve_entity_name_fallbacks() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(1u32, "player".to_string());
+        assert_eq!(
+            resolve_entity_name(Some(1), Some("legacy"), "raw", &map),
+            "player"
+        );
+        // Id not in the map: falls back to the legacy string, then raw name.
+        assert_eq!(
+            resolve_entity_name(Some(9), Some("legacy"), "raw", &map),
+            "legacy"
+        );
+        assert_eq!(resolve_entity_name(Some(9), None, "raw", &map), "raw");
+        assert_eq!(resolve_entity_name(None, None, "raw", &map), "raw");
+        // Legacy-only row ignores the map.
+        assert_eq!(
+            resolve_entity_name(None, Some("legacy"), "raw", &map),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn unregistered_component_parses_and_keeps_data() {
+        let unreg: ComponentSnapshot =
+            serde_json::from_value(json!({"slug": "SecretComp", "_unregistered": true})).unwrap();
+        assert!(matches!(unreg, ComponentSnapshot::Unregistered { .. }));
+        assert_eq!(unreg.slug(), "SecretComp");
+        // Data payloads must still match the Data variant, not fall through.
+        let data: ComponentSnapshot = serde_json::from_value(json!({
+            "slug": "TransformComponent", "data": {"position": [0, 0, 0]}
+        }))
+        .unwrap();
+        assert!(matches!(data, ComponentSnapshot::Data { .. }));
     }
 
     #[test]
