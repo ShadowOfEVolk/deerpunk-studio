@@ -437,11 +437,6 @@ impl ProfilerUi {
 
         self.run_pack_pass_if_needed(frame_view);
 
-        if !puffin::are_scopes_on() {
-            ui.colored_label(ERROR_COLOR, "The puffin profiler is OFF!")
-                .on_hover_text("Turn it on with puffin::set_scopes_on(true)");
-        }
-
         if frame_view.is_empty() {
             ui.label("No profiling data");
             return;
