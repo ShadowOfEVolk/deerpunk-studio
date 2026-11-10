@@ -2,7 +2,6 @@
 //! the engine logger colors its output on a TTY and stdin works for console
 //! commands. Terminal echo is disabled so typed input is not duplicated.
 
-
 use std::os::unix::io::RawFd;
 use std::process::{Child, Command, Stdio};
 
@@ -17,12 +16,22 @@ impl PtySession {
     /// buffering). `cmd` should already have args/cwd/env set; stdio is
     /// replaced by the PTY slave in `pre_exec`.
     pub fn spawn(cmd: &mut Command) -> Result<PtySession, String> {
-
         let mut master: RawFd = -1;
         let mut slave: RawFd = -1;
-        let mut ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+        let mut ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         let rc = unsafe {
-            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws)
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut ws,
+            )
         };
         if rc != 0 {
             return Err(format!("openpty: {}", std::io::Error::last_os_error()));
@@ -71,7 +80,11 @@ impl PtySession {
                     if slave_fd > 2 {
                         libc::close(slave_fd);
                     }
-                    libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, std::ptr::null::<libc::c_void>());
+                    libc::ioctl(
+                        0,
+                        libc::TIOCSCTTY as libc::c_ulong,
+                        std::ptr::null::<libc::c_void>(),
+                    );
                     libc::close(master_fd);
                     Ok(())
                 });
@@ -83,15 +96,14 @@ impl PtySession {
         unsafe { libc::close(slave) };
 
         let pid = child.id();
+        debug_log(&format!("spawn pid={pid} master={master}"));
         Ok(PtySession { child, master, pid })
     }
 
     /// Read whatever is pending on the master; `Ok(0)` = child closed its
     /// side (EOF), `Err` with `WouldBlock` = nothing right now.
     pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = unsafe {
-            libc::read(self.master, buf.as_mut_ptr().cast(), buf.len())
-        };
+        let n = unsafe { libc::read(self.master, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -104,7 +116,11 @@ impl PtySession {
         let mut off = 0;
         while off < payload.len() {
             let n = unsafe {
-                libc::write(self.master, payload[off..].as_ptr().cast(), payload.len() - off)
+                libc::write(
+                    self.master,
+                    payload[off..].as_ptr().cast(),
+                    payload.len() - off,
+                )
             };
             if n < 0 {
                 return Err(std::io::Error::last_os_error().to_string());
@@ -130,6 +146,11 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        let status = self.child.try_wait().ok().flatten();
+        debug_log(&format!(
+            "drop pid={} master={} child_status={status:?}",
+            self.pid, self.master
+        ));
         unsafe { libc::close(self.master) };
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -140,6 +161,26 @@ fn close_pair(master: RawFd, slave: RawFd) {
     unsafe {
         libc::close(master);
         libc::close(slave);
+    }
+}
+
+/// Low-level PTY lifecycle diagnostics, enabled by `DEERPUNK_STUDIO_PTY_DEBUG`
+/// (path to an append-only log). Bypasses the UI so events survive a dead GUI.
+pub(crate) fn debug_log(msg: &str) {
+    let Ok(path) = std::env::var("DEERPUNK_STUDIO_PTY_DEBUG") else {
+        return;
+    };
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[{ts}] {msg}");
     }
 }
 

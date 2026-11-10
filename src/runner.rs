@@ -35,8 +35,12 @@ pub struct Step {
 }
 
 /// Fixed pre_run pipeline step names (shared with the UI).
-pub const STEP_NAMES: [&str; 4] =
-    ["build game libs", "install game libs", "build engine", "launch engine"];
+pub const STEP_NAMES: [&str; 4] = [
+    "build game libs",
+    "install game libs",
+    "build engine",
+    "launch engine",
+];
 
 pub enum Event {
     Console(Vec<u8>),
@@ -135,10 +139,22 @@ fn pipeline(plan: &InstancePlan, cmd_rx: &Receiver<Cmd>, ev: &Sender<Event>) {
     )));
 
     let mut steps = vec![
-        Step { name: "build game libs".into(), state: StepState::Pending },
-        Step { name: "install game libs".into(), state: StepState::Pending },
-        Step { name: "build engine".into(), state: StepState::Pending },
-        Step { name: "launch engine".into(), state: StepState::Pending },
+        Step {
+            name: "build game libs".into(),
+            state: StepState::Pending,
+        },
+        Step {
+            name: "install game libs".into(),
+            state: StepState::Pending,
+        },
+        Step {
+            name: "build engine".into(),
+            state: StepState::Pending,
+        },
+        Step {
+            name: "launch engine".into(),
+            state: StepState::Pending,
+        },
     ];
 
     match step_build_gamelibs(plan, cmd_rx, ev, &mut steps, 0) {
@@ -193,9 +209,16 @@ fn step_build_gamelibs(
     }
     apply_profile(&mut cmd, &plan.profile.game_profile);
     if !plan.profile.game_features.is_empty() {
-        cmd.arg("--features").arg(plan.profile.game_features.join(","));
+        cmd.arg("--features")
+            .arg(plan.profile.game_features.join(","));
     }
-    build_outcome(pump(&mut cmd, cmd_rx, ev), steps, ev, idx, "game build failed")
+    build_outcome(
+        pump(&mut cmd, cmd_rx, ev),
+        steps,
+        ev,
+        idx,
+        "game build failed",
+    )
 }
 
 fn step_install_gamelibs(
@@ -219,7 +242,10 @@ fn step_install_gamelibs(
             .join(&lib.slot)
             .join(format!("{}{}", lib.artifact, lib_suffix));
         if !src.is_file() {
-            let _ = ev.send(Event::Note(format!("[studio] missing artifact {}", src.display())));
+            let _ = ev.send(Event::Note(format!(
+                "[studio] missing artifact {}",
+                src.display()
+            )));
             set_step(steps, ev, idx, StepState::Failed("artifact missing".into()));
             let _ = ev.send(Event::State(RunState::Failed("game build failed".into())));
             return Outcome::Failed;
@@ -262,7 +288,13 @@ fn step_build_engine(
         .arg("--features")
         .arg(plan.profile.engine_features.join(","));
     apply_profile(&mut cmd, &plan.profile.engine_profile);
-    build_outcome(pump(&mut cmd, cmd_rx, ev), steps, ev, idx, "engine build failed")
+    build_outcome(
+        pump(&mut cmd, cmd_rx, ev),
+        steps,
+        ev,
+        idx,
+        "engine build failed",
+    )
 }
 
 fn build_outcome(
@@ -278,7 +310,12 @@ fn build_outcome(
             Outcome::Ok
         }
         PumpResult::Exited(code) => {
-            set_step(steps, ev, idx, StepState::Failed(format!("exit code {code}")));
+            set_step(
+                steps,
+                ev,
+                idx,
+                StepState::Failed(format!("exit code {code}")),
+            );
             let _ = ev.send(Event::State(RunState::Failed(fail_msg.to_string())));
             Outcome::Failed
         }
@@ -299,7 +336,10 @@ fn step_launch_engine(
             steps,
             ev,
             idx,
-            StepState::Failed(format!("engine repo not found: {}", plan.engine_dir.display())),
+            StepState::Failed(format!(
+                "engine repo not found: {}",
+                plan.engine_dir.display()
+            )),
         );
         let _ = ev.send(Event::State(RunState::Failed("engine repo missing".into())));
         return;
@@ -349,9 +389,16 @@ fn step_launch_engine(
             let _ = ev.send(Event::State(RunState::Idle));
         }
         PumpResult::Exited(code) => {
-            set_step(steps, ev, idx, StepState::Failed(format!("exit code {code}")));
+            set_step(
+                steps,
+                ev,
+                idx,
+                StepState::Failed(format!("exit code {code}")),
+            );
             let _ = ev.send(Event::Exited(code));
-            let _ = ev.send(Event::State(RunState::Failed(format!("engine exited with {code}"))));
+            let _ = ev.send(Event::State(RunState::Failed(format!(
+                "engine exited with {code}"
+            ))));
         }
         PumpResult::Stopped => {
             set_step(steps, ev, idx, StepState::Ok);
@@ -383,25 +430,31 @@ fn pump(cmd: &mut Command, cmd_rx: &Receiver<Cmd>, ev: &Sender<Event>) -> PumpRe
     loop {
         match session.read(&mut buf) {
             Ok(0) => {
-                let code = session
+                crate::pty::debug_log("pty read: EOF");
+                // An EOF on the master is not proof the child exited (the
+                // slave can be closed independently); only trust the wait
+                // status. Keep pumping until the child is really gone.
+                if session
                     .child
-                    .wait()
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-                return finish_pump(code, stopped);
+                    .try_wait()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false)
+                {
+                    let status = session.child.wait();
+                    crate::pty::debug_log(&format!("pump exit after EOF: {status:?}"));
+                    return finish_pump(exit_code(&status), stopped);
+                }
             }
             Ok(n) => {
                 let _ = ev.send(Event::Console(buf[..n].to_vec()));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
+                crate::pty::debug_log(&format!("pty read error: {e}"));
                 let _ = ev.send(Event::Note(format!("[studio] pty read: {e}")));
-                let code = session
-                    .child
-                    .wait()
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-                return finish_pump(code, stopped);
+                let status = session.child.wait();
+                crate::pty::debug_log(&format!("pump exit after read error: {status:?}"));
+                return finish_pump(exit_code(&status), stopped);
             }
         }
 
@@ -433,13 +486,15 @@ fn pump(cmd: &mut Command, cmd_rx: &Receiver<Cmd>, ev: &Sender<Event>) -> PumpRe
             }
         }
 
-        if session.child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
-            let code = session
-                .child
-                .wait()
-                .map(|s| s.code().unwrap_or(-1))
-                .unwrap_or(-1);
-            return finish_pump(code, stopped);
+        if session
+            .child
+            .try_wait()
+            .map(|s| s.is_some())
+            .unwrap_or(false)
+        {
+            let status = session.child.wait();
+            crate::pty::debug_log(&format!("pump exit: {status:?}"));
+            return finish_pump(exit_code(&status), stopped);
         }
 
         std::thread::sleep(Duration::from_millis(20));
@@ -453,6 +508,11 @@ fn finish_pump(code: i32, stopped: bool) -> PumpResult {
     } else {
         PumpResult::Exited(code)
     }
+}
+
+/// Exit code for `Event::Exited`; signal deaths collapse to -1.
+fn exit_code(status: &std::io::Result<std::process::ExitStatus>) -> i32 {
+    status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
 fn apply_profile(cmd: &mut Command, profile: &str) {
@@ -485,5 +545,8 @@ fn lib_path_for(plan: &InstancePlan, slot: &str) -> PathBuf {
         .find(|l| l.slot == slot)
         .map(|l| l.artifact.clone())
         .unwrap_or_default();
-    plan.gamedir.join("dlls").join(slot).join(format!("{artifact}{lib_suffix}"))
+    plan.gamedir
+        .join("dlls")
+        .join(slot)
+        .join(format!("{artifact}{lib_suffix}"))
 }

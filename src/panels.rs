@@ -294,11 +294,11 @@ fn console_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
             for step in &app.steps {
                 let (glyph, color) = match &step.state {
                     StepState::Pending => ("…", theme::FAINT),
-                    StepState::Running => ("▶", theme::ACCENT_TEXT),
+                    StepState::Running => ("▶", theme::ACCENT),
                     StepState::Ok => ("✓", theme::GREEN),
                     StepState::Failed(_) => ("✗", theme::RED),
                 };
-                ui.label(egui::RichText::new(glyph).color(color));
+                ui.label(egui::RichText::new(glyph).small().color(color));
                 ui.label(theme::small(&step.name));
                 if let StepState::Failed(e) = &step.state {
                     ui.label(egui::RichText::new(e.clone()).small().color(theme::RED));
@@ -341,11 +341,12 @@ fn console_panel(ui: &mut egui::Ui, app: &mut StudioApp) {
     ui.separator();
     ui.horizontal(|ui| {
         let running = app.run_state == RunState::Running;
-        ui.monospace(">");
+        ui.add(egui::Label::new(theme::mono_colored(">", theme::MUTED)));
         let hint = if running { "console command…" } else { "engine not running" };
         let resp = ui.add(
             egui::TextEdit::singleline(&mut app.input)
-                .hint_text(hint)
+                .hint_text(egui::RichText::new(hint).color(theme::FAINT))
+                .text_color(theme::CONSOLE_TEXT)
                 .desired_width(f32::INFINITY),
         );
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -362,10 +363,12 @@ fn render_console_line(ui: &mut egui::Ui, line: &[ansi::Span]) {
         let mut color = span
             .style
             .color
-            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
-            .unwrap_or(theme::TEXT);
+            .map(|(r, g, b)| theme::console_soften(egui::Color32::from_rgb(r, g, b)))
+            .unwrap_or(theme::CONSOLE_TEXT);
         if span.style.dim {
-            color = egui::Color32::from_rgb(color.r() * 6 / 10, color.g() * 6 / 10, color.b() * 6 / 10);
+            // Widen before multiplying: u8 * 6 overflows for components > 42.
+            let dim = |v: u8| ((v as u16) * 6 / 10) as u8;
+            color = egui::Color32::from_rgb(dim(color.r()), dim(color.g()), dim(color.b()));
         }
         job.append(
             &span.text,
@@ -374,7 +377,11 @@ fn render_console_line(ui: &mut egui::Ui, line: &[ansi::Span]) {
         );
     }
     if job.is_empty() {
-        job.append(" ", 0.0, egui::TextFormat::simple(egui::FontId::monospace(13.0), theme::TEXT));
+        job.append(
+            " ",
+            0.0,
+            egui::TextFormat::simple(egui::FontId::monospace(13.0), theme::CONSOLE_TEXT),
+        );
     }
     ui.add(egui::Label::new(job));
 }

@@ -47,6 +47,14 @@ pub const J_BOOL: Color32 = c("#c3aed6");
 pub const J_NULL: Color32 = c("#808080");
 pub const J_PUNCT: Color32 = c("#808080");
 
+// Console stream: Blender-console-level text, readable without glaring.
+pub const CONSOLE_TEXT: Color32 = c("#c8c8c8");
+/// Brightness above which a near-neutral ANSI color is softened to
+/// `CONSOLE_TEXT` (white cargo lines should not glare).
+const CONSOLE_BRIGHT_MAX: u8 = 230;
+/// Max channel spread for an ANSI color to count as near-neutral.
+const CONSOLE_NEUTRAL_SPREAD: u8 = 24;
+
 const fn hex_val(b: u8) -> u32 {
     match b {
         b'0'..=b'9' => (b - b'0') as u32,
@@ -70,6 +78,19 @@ const fn c(hex: &str) -> Color32 {
         ((v >> 8) & 0xFF) as u8,
         (v & 0xFF) as u8,
     )
+}
+
+/// Soften bright near-neutral ANSI colors (white/gray) down to the console
+/// text level; genuinely colored spans (green/cyan/yellow/red) pass through.
+pub fn console_soften(color: Color32) -> Color32 {
+    let (r, g, b) = (color.r(), color.g(), color.b());
+    let max = r.max(g).max(b);
+    let near_neutral = max - r.min(g).min(b) <= CONSOLE_NEUTRAL_SPREAD;
+    if near_neutral && max > CONSOLE_BRIGHT_MAX {
+        CONSOLE_TEXT
+    } else {
+        color
+    }
 }
 
 /// Apply the Blender-inspired look: flat, sharp, dense.
