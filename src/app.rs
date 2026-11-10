@@ -14,6 +14,7 @@ use crate::ansi::Stream;
 use crate::assets::{self, ScanResult};
 use crate::config::StudioConfig;
 use crate::gameinfo::GameInfo;
+use crate::mcp::McpManager;
 use crate::net::{ConnState, NetClient, NetCmd, NetEvent};
 use crate::panels;
 use crate::profiles::Profiles;
@@ -61,6 +62,16 @@ pub struct Scenario {
 pub struct PuffinTab {
     pub client: puffin_http::Client,
     pub profiler: puffin_egui::ProfilerUi,
+}
+
+impl PuffinTab {
+    /// Connect a self-pumping profiler client to `addr` (host:port).
+    pub fn new(addr: &str) -> Self {
+        Self {
+            client: puffin_http::Client::new(addr.to_string()),
+            profiler: puffin_egui::ProfilerUi::default(),
+        }
+    }
 }
 
 /// Game icon bytes, read and decode-checked once per project. Fed to egui
@@ -121,6 +132,12 @@ pub struct StudioApp {
     // Puffin profiler connection (View::Puffin).
     pub puffin: Option<PuffinTab>,
     pub puffin_addr: String,
+    pub puffin_auto: bool,
+    pub puffin_retry_at: Instant,
+
+    // MCP server (deerpunk-mcp child process) + its status modal.
+    pub mcp: McpManager,
+    pub mcp_modal_open: bool,
 
     // Layout state.
     pub active_view: View,
@@ -186,6 +203,8 @@ impl StudioApp {
             console_open: true,
             puffin: None,
             puffin_addr: "127.0.0.1:8585".into(),
+            puffin_auto: true,
+            puffin_retry_at: Instant::now(),
             active_view: View::Files,
             cvars_category: None,
             open_tabs: Vec::new(),
@@ -199,6 +218,8 @@ impl StudioApp {
             show_gameinfo_modal: false,
             last_recents: Vec::new(),
             game_icon: None,
+            mcp: McpManager::new(9100),
+            mcp_modal_open: false,
             cvars_filter: String::new(),
             filters: HashMap::new(),
         };
@@ -217,6 +238,13 @@ impl StudioApp {
         // `--run`: start the instance immediately (build + engine launch).
         if args.iter().any(|a| a == "--run") {
             app.run_instance();
+        }
+        // Puffin auto-connect: the client retries below once the game is up.
+        app.puffin = Some(PuffinTab::new(&app.puffin_addr));
+        // Inspector auto-connect even without a project (engine may already
+        // be running); open_project() connects on its own.
+        if !app.want_connected {
+            app.connect();
         }
         app
     }
@@ -306,6 +334,28 @@ impl StudioApp {
         if let Ok(port) = self.port.trim().parse::<u16>() {
             self.net.cmd(NetCmd::Connect { host, port });
         }
+    }
+
+    /// Keep the puffin client alive in auto mode: recreate it while the
+    /// game's profiler server is not reachable yet (e.g. at app launch).
+    fn tick_puffin(&mut self) {
+        if self.puffin.is_none() && self.puffin_auto {
+            self.puffin = Some(PuffinTab::new(&self.puffin_addr));
+            self.puffin_retry_at = Instant::now() + Duration::from_secs(3);
+            return;
+        }
+        let Some(tab) = self.puffin.as_mut() else {
+            return;
+        };
+        if self.puffin_auto && !tab.client.connected() && Instant::now() >= self.puffin_retry_at {
+            tab.client = puffin_http::Client::new(self.puffin_addr.clone());
+            self.puffin_retry_at = Instant::now() + Duration::from_secs(3);
+        }
+    }
+
+    /// Inspector WS address as `host:port` (for the MCP server args).
+    fn inspector_addr(&self) -> String {
+        format!("{}:{}", self.host.trim(), self.port.trim())
     }
 
     fn rpc(&mut self, method: &str, params: Value) {
@@ -431,7 +481,9 @@ impl StudioApp {
         for ev in events {
             match ev {
                 NetEvent::State(state) => {
-                    if state == ConnState::Disconnected && self.want_connected {
+                    if matches!(state, ConnState::Disconnected | ConnState::Error(_))
+                        && self.want_connected
+                    {
                         self.reconnect_at = Some(Instant::now() + RECONNECT_DELAY);
                     }
                     if state == ConnState::Connected {
@@ -611,16 +663,13 @@ impl StudioApp {
         // Plain label look: no button chrome (fill AND stroke off), font
         // larger than every other control in the bar — it's the game logo.
         let name_resp = ui.add(
-            egui::Button::new(
-                egui::RichText::new(name)
-                    .strong()
-                    .size(21.0)
-                    .color(if has_project {
-                        theme::TEXT
-                    } else {
-                        theme::MUTED
-                    }),
-            )
+            egui::Button::new(egui::RichText::new(name).strong().size(21.0).color(
+                if has_project {
+                    theme::TEXT
+                } else {
+                    theme::MUTED
+                },
+            ))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
             .truncate(),
@@ -648,7 +697,6 @@ impl StudioApp {
             self.last_recents = recents;
         }
     }
-
 
     /// Center zone: ONE mega launch button — play icon, `profile / scenario`
     /// label, and a dropdown chevron sharing a single frame. While a run is
@@ -697,8 +745,7 @@ impl StudioApp {
         let text_w = galley.size().x.min(max_text_w);
 
         let total_w = PLAY_W + text_w + CHEV_W + 20.0;
-        let (rect, mega) =
-            ui.allocate_exact_size(egui::vec2(total_w, BTN_H), egui::Sense::HOVER);
+        let (rect, mega) = ui.allocate_exact_size(egui::vec2(total_w, BTN_H), egui::Sense::HOVER);
 
         // Soft glow while running: layered rounded strokes of decreasing
         // alpha (renders reliably under wgpu, unlike frame shadows).
@@ -746,7 +793,11 @@ impl StudioApp {
                 self.run_instance();
             }
         }
-        play.on_hover_text(if running { "Stop instance" } else { "Run instance" });
+        play.on_hover_text(if running {
+            "Stop instance"
+        } else {
+            "Run instance"
+        });
 
         // Label, clipped to its zone (single line, truncate to fit).
         p.with_clip_rect(text_rect.intersect(rect)).text(
@@ -760,7 +811,10 @@ impl StudioApp {
         // Subtle vertical divider between label and chevron.
         let dx = chev_rect.left() - 3.0;
         p.line_segment(
-            [egui::pos2(dx, rect.top() + 6.0), egui::pos2(dx, rect.bottom() - 6.0)],
+            [
+                egui::pos2(dx, rect.top() + 6.0),
+                egui::pos2(dx, rect.bottom() - 6.0),
+            ],
             egui::Stroke::new(1.0, tinted(theme::TEXT, 0x26)),
         );
 
@@ -812,7 +866,6 @@ impl StudioApp {
                 ui.close();
             }
         });
-
 
         ui.separator();
         connect_dot(ui, &self.conn_state);
@@ -972,6 +1025,21 @@ impl StudioApp {
             if matches!(self.conn_state, ConnState::Connected | ConnState::Error(_)) {
                 ui.label(theme::small(format!("{}:{}", self.host, self.port)));
             }
+            let mcp_up = self.mcp.is_running();
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(ph::PLUG).small().color(if mcp_up {
+                        theme::GREEN
+                    } else {
+                        theme::MUTED
+                    }))
+                    .frame(false),
+                )
+                .on_hover_text("MCP server for AI agents")
+                .clicked()
+            {
+                self.mcp_modal_open = true;
+            }
             if ui
                 .add(egui::Button::new(theme::small("connect")).frame(false))
                 .clicked()
@@ -1082,6 +1150,15 @@ impl eframe::App for StudioApp {
         self.poll_runner();
         self.poll_native_menu();
         self.handle_dropped_files(ui);
+        self.tick_puffin();
+        {
+            let inspector = self.inspector_addr();
+            self.mcp.ensure_started(&inspector);
+        }
+        self.mcp.poll();
+        if self.mcp_modal_open {
+            self.mcp.request_status();
+        }
 
         // Paint the whole window first so no platform clear color leaks.
         let full = ui.available_rect_before_wrap();
@@ -1111,19 +1188,21 @@ impl eframe::App for StudioApp {
             )
             .show(ui, |ui| self.rail(ui));
 
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(250.0)
-            .min_size(140.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 6)),
-            )
-            .show(ui, |ui| {
-                let view = self.active_view.clone();
-                panels::sidebar(ui, self, &view);
-            });
+        if !matches!(self.active_view, View::Puffin) {
+            egui::Panel::left("sidebar")
+                .resizable(true)
+                .default_size(250.0)
+                .min_size(140.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 6)),
+                )
+                .show(ui, |ui| {
+                    let view = self.active_view.clone();
+                    panels::sidebar(ui, self, &view);
+                });
+        }
 
         // Bottom panels: the first one shown lands at the very bottom edge —
         // status bar first, console stacked above it.
@@ -1163,6 +1242,10 @@ impl eframe::App for StudioApp {
 
         if self.show_gameinfo_modal {
             self.gameinfo_modal(ui.ctx());
+        }
+
+        if self.mcp_modal_open {
+            panels::mcp_modal(ui.ctx(), self);
         }
 
         if let Some(project) = &self.project {
@@ -1265,7 +1348,6 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
         ui.label(theme::mono_text(value));
     });
 }
-
 
 fn absolute(p: &std::path::Path) -> PathBuf {
     if p.is_absolute() {

@@ -26,12 +26,12 @@ mod imp {
     use std::sync::LazyLock;
     use std::sync::Mutex;
 
-    use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject};
     use objc2::sel;
-    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem, NSEventModifierFlags};
-    use objc2_foundation::{ns_string, MainThreadMarker, NSString};
+    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability};
+    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+    use objc2_foundation::{MainThreadMarker, NSString, ns_string};
 
     use super::NativeMenuAction;
 
@@ -112,9 +112,7 @@ mod imp {
         key: &'static NSString,
     ) -> Retained<NSMenuItem> {
         // SAFETY: plain NSMenuItem construction on the main thread.
-        unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), title, action, key)
-        }
+        unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), title, action, key) }
     }
 
     /// Remove any previously installed "File" menu (our own re-run) so the
@@ -165,8 +163,7 @@ mod imp {
             Some(sel!(openProject:)),
             ns_string!("o"),
         );
-        open_item
-            .setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+        open_item.setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
         // SAFETY: our target lives forever in the TARGET static.
         unsafe { open_item.setTarget(Some(target)) };
 
@@ -188,23 +185,29 @@ mod imp {
     }
 
     pub fn set_recents(paths: &[String]) {
-        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
         // SAFETY: sharedApplication on the main thread.
         let app = NSApplication::sharedApplication(mtm);
-        let Some(main_menu) = (unsafe { app.mainMenu() }) else { return };
+        let Some(main_menu) = (unsafe { app.mainMenu() }) else {
+            return;
+        };
         let Some(target) = target(mtm) else { return };
 
-        let Some(file_holder) = (unsafe { main_menu.itemWithTitle(ns_string!("File")) })
+        let Some(file_holder) = (unsafe { main_menu.itemWithTitle(ns_string!("File")) }) else {
+            return;
+        };
+        let Some(file_menu) = (unsafe { file_holder.submenu() }) else {
+            return;
+        };
+        let Some(recents_holder) = (unsafe { file_menu.itemWithTitle(ns_string!("Open Recent")) })
         else {
             return;
         };
-        let Some(file_menu) = (unsafe { file_holder.submenu() }) else { return };
-        let Some(recents_holder) =
-            (unsafe { file_menu.itemWithTitle(ns_string!("Open Recent")) })
-        else {
+        let Some(recents_menu) = (unsafe { recents_holder.submenu() }) else {
             return;
         };
-        let Some(recents_menu) = (unsafe { recents_holder.submenu() }) else { return };
         // SAFETY: clearing the current recent items before rebuilding.
         unsafe { recents_menu.removeAllItems() };
 

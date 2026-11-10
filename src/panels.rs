@@ -39,7 +39,7 @@ pub fn sidebar(ui: &mut egui::Ui, app: &mut StudioApp, view: &View) {
         View::Files => files_sidebar(ui, app),
         View::Cvars => cvars_sidebar(ui, app),
         View::LaunchSettings => launch_settings_sidebar(ui, app),
-        View::Puffin => puffin_sidebar(ui, app),
+        View::Puffin => {} // full-width trace; sidebar panel is skipped
         View::Live(id) => collection_sidebar(ui, app, id),
     }
 }
@@ -262,14 +262,22 @@ fn tree_row(
         egui::Align2::CENTER_CENTER,
         glyph,
         egui::FontId::proportional(13.0),
-        if selected { egui::Color32::WHITE } else { theme::TEXT_DIM },
+        if selected {
+            egui::Color32::WHITE
+        } else {
+            theme::TEXT_DIM
+        },
     );
     ui.painter().text(
         egui::pos2(icon_col + 17.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         name,
         egui::FontId::proportional(13.0),
-        if selected { egui::Color32::WHITE } else { color },
+        if selected {
+            egui::Color32::WHITE
+        } else {
+            color
+        },
     );
     resp
 }
@@ -296,7 +304,16 @@ fn render_tree_node(
             ph::FOLDER_SIMPLE
         };
         let mut open = state.is_open();
-        if tree_row(ui, indent, glyph, false, &node.name, selected_text_color(false)).clicked() {
+        if tree_row(
+            ui,
+            indent,
+            glyph,
+            false,
+            &node.name,
+            selected_text_color(false),
+        )
+        .clicked()
+        {
             open = !open;
         }
         if open != state.is_open() {
@@ -407,8 +424,11 @@ fn files_center(ui: &mut egui::Ui, app: &mut StudioApp) {
                         let x = x.on_hover_cursor(egui::CursorIcon::PointingHand);
                         if x.hovered() {
                             // Brighten the small close glyph on hover.
-                            inner.painter()
-                                .rect_filled(x.rect, 2.0, egui::Color32::from_white_alpha(25));
+                            inner.painter().rect_filled(
+                                x.rect,
+                                2.0,
+                                egui::Color32::from_white_alpha(25),
+                            );
                         }
                         if x.clicked() {
                             close = Some(i);
@@ -547,11 +567,11 @@ fn text_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
         .id_salt(format!("text_viewer_{}", tab.path.display()))
         .auto_shrink(false)
         .show(ui, |ui| {
-        ui.add(
-            egui::Label::new(theme::mono_text(&cached.content))
-                .wrap_mode(egui::TextWrapMode::Extend),
-        );
-    });
+            ui.add(
+                egui::Label::new(theme::mono_text(&cached.content))
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        });
 }
 
 fn image_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
@@ -561,24 +581,24 @@ fn image_viewer(ui: &mut egui::Ui, tab: &OpenFile) {
         .id_salt(format!("image_viewer_{}", tab.path.display()))
         .auto_shrink(false)
         .show(ui, |ui| {
-        ui.add_space(4.0);
-        // Show at native size, downscaled only when larger than the pane —
-        // `max_size` alone would blow 16px icons up to the full area.
-        let avail = ui.available_size();
-        let display = match image_dims(&tab.path) {
-            Some((w, h)) if w > 0 && h > 0 => {
-                let native = egui::vec2(w as f32, h as f32);
-                native * (avail.x / native.x).min(avail.y / native.y).min(1.0)
-            }
-            _ => egui::vec2(64.0, 64.0),
-        };
-        ui.add(egui::Image::new(egui::ImageSource::Uri(uri.into())).fit_to_exact_size(display));
-        ui.add_space(6.0);
-        ui.weak(match image_dims(&tab.path) {
-            Some((w, h)) => format!("{size} bytes · {} · {w}×{h} px", fmt_size(size)),
-            None => format!("{size} bytes · {}", fmt_size(size)),
+            ui.add_space(4.0);
+            // Show at native size, downscaled only when larger than the pane —
+            // `max_size` alone would blow 16px icons up to the full area.
+            let avail = ui.available_size();
+            let display = match image_dims(&tab.path) {
+                Some((w, h)) if w > 0 && h > 0 => {
+                    let native = egui::vec2(w as f32, h as f32);
+                    native * (avail.x / native.x).min(avail.y / native.y).min(1.0)
+                }
+                _ => egui::vec2(64.0, 64.0),
+            };
+            ui.add(egui::Image::new(egui::ImageSource::Uri(uri.into())).fit_to_exact_size(display));
+            ui.add_space(6.0);
+            ui.weak(match image_dims(&tab.path) {
+                Some((w, h)) => format!("{size} bytes · {} · {w}×{h} px", fmt_size(size)),
+                None => format!("{size} bytes · {}", fmt_size(size)),
+            });
         });
-    });
 }
 
 /// Pixel dimensions from the PNG IHDR or JPEG SOF header (no full decode).
@@ -861,7 +881,6 @@ fn selected_text_color(selected: bool) -> egui::Color32 {
         theme::TEXT_DIM
     }
 }
-
 
 // -------------------------------------------------------------- cvars view
 
@@ -1294,40 +1313,42 @@ fn scalar_value(ui: &mut egui::Ui, v: &Value) {
 
 // -------------------------------------------------------------- puffin view
 
-fn puffin_sidebar(ui: &mut egui::Ui, app: &mut StudioApp) {
-    sidebar_header(
-        ui,
-        "Puffin",
-        if app.puffin.is_some() { "live" } else { "offline" },
-    );
-    ui.label(theme::small("addr"));
-    ui.add(
-        egui::TextEdit::singleline(&mut app.puffin_addr)
-            .desired_width(ui.available_width() - 16.0),
-    );
-    ui.add_space(4.0);
-    match &app.puffin {
-        Some(_) => {
-            if ui.button("Disconnect").clicked() {
-                app.puffin = None;
-            }
-            ui.weak("flame graph renders in the center pane");
-        }
-        None => {
-            if ui.button("Connect").clicked() {
-                app.puffin = Some(crate::app::PuffinTab {
-                    client: puffin_http::Client::new(app.puffin_addr.clone()),
-                    profiler: puffin_egui::ProfilerUi::default(),
-                });
-            }
-            ui.weak("the game must run with the puffin feature (dev profile)");
-        }
-    }
-}
-
 fn puffin_center(ui: &mut egui::Ui, app: &mut StudioApp) {
+    // Slim toolbar instead of a sidebar: status, address, auto-reconnect.
+    ui.horizontal(|ui| {
+        let live = app.puffin.as_ref().is_some_and(|t| t.client.connected());
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(
+            dot_rect.center(),
+            3.5,
+            if live { theme::GREEN } else { theme::MUTED },
+        );
+        ui.label(theme::small(if live {
+            "tracing"
+        } else if app.puffin.is_some() {
+            "waiting for game…"
+        } else {
+            "offline"
+        }));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.puffin_addr)
+                .desired_width(150.0)
+                .hint_text("127.0.0.1:8585"),
+        );
+        ui.checkbox(&mut app.puffin_auto, theme::small("auto"));
+        if ui.button("reconnect").clicked() {
+            app.puffin_auto = true;
+            app.puffin = Some(crate::app::PuffinTab::new(app.puffin_addr.trim()));
+            app.puffin_retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        }
+        if ui.button("disconnect").clicked() {
+            app.puffin_auto = false;
+            app.puffin = None;
+        }
+    });
+    ui.add_space(4.0);
     let Some(tab) = app.puffin.as_mut() else {
-        ui.centered_and_justified(|ui| ui.weak("connect from the sidebar"));
+        ui.centered_and_justified(|ui| ui.weak("puffin offline — press reconnect"));
         return;
     };
     // puffin_viewer pattern: the client self-pumps frames; ProfilerUi
@@ -1336,4 +1357,148 @@ fn puffin_center(ui: &mut egui::Ui, app: &mut StudioApp) {
         ui,
         &mut puffin_egui::MaybeMutRef::MutRef(&mut tab.client.frame_view()),
     );
+}
+
+// --------------------------------------------------------------- mcp modal
+
+/// Statusbar modal: MCP server state, endpoints, tools and agent hookup
+/// instructions.
+pub fn mcp_modal(ctx: &egui::Context, app: &mut StudioApp) {
+    egui::Window::new("MCP server")
+        .open(&mut app.mcp_modal_open)
+        .default_width(480.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            app.mcp.request_status();
+            let running = app.mcp.is_running();
+            ui.horizontal(|ui| {
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    dot_rect.center(),
+                    3.5,
+                    if running { theme::GREEN } else { theme::RED },
+                );
+                ui.strong(if running { "running" } else { "stopped" });
+                if let Some(st) = &app.mcp.status {
+                    ui.weak(theme::small(format!(
+                        "v{} · up {:.0}s",
+                        st.version, st.uptime_secs
+                    )));
+                }
+            });
+            let inspector_addr = format!("{}:{}", app.host.trim(), app.port.trim());
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("Start"))
+                    .clicked()
+                {
+                    app.mcp.restart(&inspector_addr);
+                }
+                if ui
+                    .add_enabled(running, egui::Button::new("Stop"))
+                    .clicked()
+                {
+                    app.mcp.stop();
+                }
+                if ui.button("Restart").clicked() {
+                    app.mcp.restart(&inspector_addr);
+                }
+            });
+            ui.separator();
+
+            ui.strong("Endpoints");
+            let port = app.mcp.port();
+            copy_row(ui, "local", &format!("http://127.0.0.1:{port}/mcp"));
+            if let Some(ip) = crate::mcp::local_ip() {
+                copy_row(ui, "LAN", &format!("http://{ip}:{port}/mcp"));
+            }
+
+            ui.separator();
+            ui.strong("Inspector link");
+            match app.mcp.status.as_ref().and_then(|s| s.inspector.clone()) {
+                Some(ins) => {
+                    ui.label(format!(
+                        "{} — {}",
+                        if ins.connected { "connected" } else { "not connected" },
+                        ins.addr
+                    ));
+                }
+                None => {
+                    if let Some(err) = &app.mcp.status_err {
+                        ui.colored_label(theme::YELLOW, err.clone());
+                    } else {
+                        ui.weak("no status yet…");
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.strong("Tools");
+            match app.mcp.status.as_ref() {
+                Some(st) if !st.tools.is_empty() => {
+                    for tool in &st.tools {
+                        ui.label(theme::small(format!(
+                            "{} — {}",
+                            tool.name, tool.description
+                        )));
+                    }
+                }
+                Some(_) => {
+                    ui.weak("no tools exposed");
+                }
+                None => {
+                    ui.weak("status pending…");
+                }
+            }
+
+            ui.separator();
+            ui.strong("Connecting an agent");
+            ui.label("Streamable HTTP MCP server. Client config:");
+            let ip = crate::mcp::local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let cfg = format!(
+                "{{\n  \"mcpServers\": {{\n    \"deerpunk\": {{ \"url\": \"http://{ip}:{port}/mcp\" }}\n  }}\n}}"
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut cfg.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(5)
+                    .interactive(false),
+            );
+            if ui.button("copy config").clicked() {
+                ui.output_mut(|o| o.commands.push(egui::OutputCommand::CopyText(cfg.clone().to_string())));
+            }
+            ui.add_space(4.0);
+            ui.label(theme::small("Generic probe:"));
+            let probe = format!(
+                "curl -s -X POST http://127.0.0.1:{port}/mcp -H 'content-type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}'"
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut probe.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(2)
+                    .interactive(false),
+            );
+            if ui.button("copy probe").clicked() {
+                ui.output_mut(|o| o.commands.push(egui::OutputCommand::CopyText(probe.clone().to_string())));
+            }
+        });
+}
+
+fn copy_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(theme::small(label));
+        ui.monospace(value);
+        if ui
+            .add(egui::Button::new(theme::small("copy")).frame(false))
+            .clicked()
+        {
+            ui.output_mut(|o| {
+                o.commands
+                    .push(egui::OutputCommand::CopyText(value.to_string()))
+            });
+        }
+    });
 }
