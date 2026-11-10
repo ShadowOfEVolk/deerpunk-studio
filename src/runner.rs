@@ -212,7 +212,7 @@ fn step_install_gamelibs(
             .project_root
             .join("target")
             .join(profile)
-            .join(format!("lib{lib_prefix}{}{lib_suffix}", lib.artifact));
+            .join(format!("{lib_prefix}{}{lib_suffix}", lib.artifact));
         let dst = plan
             .gamedir
             .join("dlls")
@@ -294,24 +294,27 @@ fn step_launch_engine(
     idx: usize,
 ) {
     set_step(steps, ev, idx, StepState::Running);
-    let engine_bin = plan
-        .engine_dir
-        .join("target")
-        .join(profile_dir(&plan.profile.engine_profile))
-        .join(if cfg!(windows) { "deerpunk.exe" } else { "deerpunk" });
-    if !engine_bin.is_file() {
+    if !plan.engine_dir.join("Cargo.toml").is_file() {
         set_step(
             steps,
             ev,
             idx,
-            StepState::Failed(format!("engine binary not found: {}", engine_bin.display())),
+            StepState::Failed(format!("engine repo not found: {}", plan.engine_dir.display())),
         );
-        let _ = ev.send(Event::State(RunState::Failed("engine binary missing".into())));
+        let _ = ev.send(Event::State(RunState::Failed("engine repo missing".into())));
         return;
     }
 
-    let mut cmd = Command::new(&engine_bin);
-    cmd.current_dir(&plan.project_root)
+    // Launch like run.sh does: `cargo run` from the engine repo (resolves the
+    // SDL2 @rpath correctly; a direct binary exec does not).
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&plan.engine_dir)
+        .arg("run")
+        .arg("--no-default-features")
+        .arg("--features")
+        .arg(plan.profile.engine_features.join(","));
+    apply_profile(&mut cmd, &plan.profile.engine_profile);
+    cmd.arg("--")
         .arg("--gamedir")
         .arg(&plan.gamedir)
         .arg("--svlib")

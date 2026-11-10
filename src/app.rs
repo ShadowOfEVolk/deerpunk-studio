@@ -339,15 +339,34 @@ impl StudioApp {
     fn poll_runner(&mut self) {
         for ev in self.runner.poll() {
             match ev {
-                RunEvent::Console(bytes) => self.console.feed(&bytes),
+                RunEvent::Console(bytes) => {
+                    self.console.feed(&bytes);
+                    self.dump_console(&bytes);
+                }
                 RunEvent::State(state) => self.run_state = state,
                 RunEvent::Step(idx, state) => {
                     if let Some(step) = self.steps.get_mut(idx) {
                         step.state = state;
                     }
                 }
-                RunEvent::Note(text) => self.console.feed(format!("{text}\n").as_bytes()),
+                RunEvent::Note(text) => {
+                    self.console.feed(format!("{text}\n").as_bytes());
+                    self.dump_console(text.as_bytes());
+                }
                 RunEvent::Exited(_) => {}
+            }
+        }
+    }
+
+    /// `DEERPUNK_STUDIO_CONSOLE=<path>`: append raw console bytes to a file
+    /// (headless debugging of instance output).
+    fn dump_console(&self, bytes: &[u8]) {
+        static CONSOLE_DUMP: std::sync::LazyLock<Option<String>> =
+            std::sync::LazyLock::new(|| std::env::var("DEERPUNK_STUDIO_CONSOLE").ok());
+        if let Some(path) = CONSOLE_DUMP.as_ref() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = f.write_all(bytes);
             }
         }
     }
@@ -623,7 +642,7 @@ impl StudioApp {
                     std::mem::replace(&mut self.files_dock, Self::build_files_dock());
                 let mut viewer = AppTabViewer { app: self };
                 DockArea::new(&mut dock)
-                    .style(dock_style())
+                    .style(dock_style(ui.style()))
                     .show_inside(ui, &mut viewer);
                 self.files_dock = dock;
             }
@@ -634,7 +653,7 @@ impl StudioApp {
                 );
                 let mut viewer = AppTabViewer { app: self };
                 DockArea::new(&mut dock)
-                    .style(dock_style())
+                    .style(dock_style(ui.style()))
                     .show_inside(ui, &mut viewer);
                 self.inspector_dock = dock;
             }
@@ -673,6 +692,12 @@ impl eframe::App for StudioApp {
         self.poll_net();
         self.poll_runner();
         self.handle_dropped_files(ui);
+
+        // eframe hands `App::ui` a transparent Ui over the OS clear color
+        // (light) — paint the Blender-style background over the whole window
+        // so no white shows through between panels.
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, theme::BG);
 
         self.top_bar(ui);
 
@@ -718,8 +743,10 @@ impl eframe::App for StudioApp {
 
 /// egui_dock chrome: flat Blender tab strip — inactive tabs sit on the header
 /// color, the active one merges into the editor surface below.
-fn dock_style() -> DockStyle {
-    let mut style = DockStyle::from_egui(&egui::Style::default());
+fn dock_style(egui_style: &egui::Style) -> DockStyle {
+    // Derive from the applied (dark) egui style — the light `Style::default()`
+    // leaked light colors into dock buttons and drag overlays.
+    let mut style = DockStyle::from_egui(egui_style);
     style.dock_area_padding = Some(egui::Margin::ZERO);
     style.main_surface_border_stroke = egui::Stroke::NONE;
 
