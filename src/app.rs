@@ -559,7 +559,7 @@ impl StudioApp {
         );
         // `top_down` centers the row horizontally; nudge it down so it is
         // centered vertically too.
-        center.add_space((center.available_height() - 26.0).max(0.0) * 0.5);
+        center.add_space((center.available_height() - 32.0).max(0.0) * 0.5);
         center.horizontal(|center| self.top_bar_center(center));
 
         let mut right = ui.new_child(
@@ -576,21 +576,13 @@ impl StudioApp {
         self.identity_block(ui);
     }
 
-    /// Game icon box (22px, pulsing accent border) with the project name
-    /// beside it. Both are clickable and open the gameinfo modal.
+    /// Game icon (32px, ~4px rounded corners, no box or border) with the
+    /// project name beside it in logo-sized type. Both are clickable and
+    /// open the gameinfo modal.
     fn identity_block(&mut self, ui: &mut egui::Ui) {
-        let size = egui::vec2(22.0, 22.0);
+        const ICON: f32 = 32.0;
+        let size = egui::vec2(ICON, ICON);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::CLICK | egui::Sense::HOVER);
-
-        // Surface + time-driven border pulse (opacity only, no rotation).
-        ui.painter().rect_filled(rect, 2.0, theme::FIELD);
-        let phase = 0.5 + 0.5 * (ui.ctx().input(|i| i.time) * 1.6).sin();
-        ui.painter().rect_stroke(
-            rect,
-            2.0,
-            egui::Stroke::new(1.0, tinted(theme::ACCENT, (64.0 + phase * 96.0) as u8)),
-            egui::StrokeKind::Inside,
-        );
 
         // The game's own icon, or a controller glyph when none loads.
         // Bytes were decode-checked at load time, so the egui-side load
@@ -602,10 +594,11 @@ impl StudioApp {
                     uri: icon.uri.into(),
                     bytes: egui::load::Bytes::Shared(icon.bytes),
                 })
-                .fit_to_exact_size(size),
+                .fit_to_exact_size(size)
+                .corner_radius(4.0),
             );
         } else {
-            glyph_box(ui, rect);
+            glyph_box(ui, rect, 17.0);
         }
 
         let has_project = self.project.is_some();
@@ -615,11 +608,16 @@ impl StudioApp {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "no project".into());
         let name_resp = ui.add(
-            egui::Button::new(egui::RichText::new(name).strong().color(if has_project {
-                theme::TEXT
-            } else {
-                theme::MUTED
-            }))
+            egui::Button::new(
+                egui::RichText::new(name)
+                    .strong()
+                    .size(17.0)
+                    .color(if has_project {
+                        theme::TEXT
+                    } else {
+                        theme::MUTED
+                    }),
+            )
             .fill(egui::Color32::TRANSPARENT)
             .truncate(),
         );
@@ -648,88 +646,172 @@ impl StudioApp {
     }
 
 
-    /// Center zone: the launch cluster — profile, scenario, launch/stop,
-    /// and a compact connection dot.
+    /// Center zone: ONE mega launch button — play icon, `profile / scenario`
+    /// label, and a dropdown chevron sharing a single frame. While a run is
+    /// active it glows softly and shows the state icon + dim label.
     fn top_bar_center(&mut self, ui: &mut egui::Ui) {
-        // Run profile.
+        const BTN_H: f32 = 32.0;
+        const PLAY_W: f32 = 40.0;
+        const CHEV_W: f32 = 28.0;
+
+        let running = self.run_state != RunState::Idle;
+        let enabled = self.project.is_some();
+        let (glyph, tint) = if running {
+            (ph::STOP, theme::RED)
+        } else {
+            (ph::PLAY, theme::ACCENT)
+        };
+
         let profile_label = self
             .profiles
             .get(&self.active_profile)
             .map(|p| p.label.clone())
             .unwrap_or_else(|| self.active_profile.clone());
-        egui::ComboBox::from_id_salt("run_profile")
-            .width(130.0)
-            .selected_text(profile_label)
-            .show_ui(ui, |ui| {
-                for id in self.profiles.order.clone() {
-                    let Some(p) = self.profiles.get(&id) else {
-                        continue;
-                    };
-                    if ui
-                        .selectable_label(id == self.active_profile, &p.label)
-                        .clicked()
-                    {
-                        self.active_profile = id;
-                    }
-                }
-            });
-        if gear_button(ui, "Edit run profiles") {
-            self.active_view = View::LaunchSettings;
-        }
-
-        ui.separator();
-
-        // Launch scenario (extra engine args).
         let scenario_label = self
             .scenarios
             .iter()
             .find(|s| s.id == self.active_scenario)
             .map(|s| s.label.clone())
             .unwrap_or_else(|| self.active_scenario.clone());
-        egui::ComboBox::from_id_salt("run_scenario")
-            .width(150.0)
-            .selected_text(scenario_label)
-            .show_ui(ui, |ui| {
-                for s in self.scenarios.clone() {
-                    if ui
-                        .selectable_label(s.id == self.active_scenario, &s.label)
-                        .clicked()
-                    {
-                        self.active_scenario = s.id;
-                    }
-                }
-            });
-        if gear_button(ui, "Edit launch scenarios") {
-            self.active_view = View::LaunchSettings;
+        let label = format!("{profile_label} / {scenario_label}");
+
+        // Truncate the label to the room we can afford (leave space for the
+        // run status and the connection dot on the right).
+        let font = egui::FontId::proportional(15.0);
+        let max_text_w = (ui.available_width() - PLAY_W - CHEV_W - 28.0 - 110.0).max(60.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label, font.clone(), theme::TEXT);
+        let text_w = galley.size().x.min(max_text_w);
+
+        let total_w = PLAY_W + text_w + CHEV_W + 20.0;
+        let (rect, mega) =
+            ui.allocate_exact_size(egui::vec2(total_w, BTN_H), egui::Sense::HOVER);
+
+        // Soft glow while running: layered rounded strokes of decreasing
+        // alpha (renders reliably under wgpu, unlike frame shadows).
+        let p = ui.painter();
+        if running {
+            for (w, a) in [(6.0, 0x18u8), (3.0, 0x30), (1.0, 0x50)] {
+                p.rect_stroke(
+                    rect.expand(w * 0.5),
+                    2.0 + w * 0.5,
+                    egui::Stroke::new(w, tinted(tint, a)),
+                    egui::StrokeKind::Outside,
+                );
+            }
         }
 
-        ui.separator();
-
-        // Launch / stop — the one accent-tinted control in the bar.
-        let running = self.run_state != RunState::Idle;
-        let (glyph, label, tint) = if running {
-            (ph::STOP, "Stop", theme::RED)
+        let fill = if !enabled {
+            theme::FIELD
+        } else if mega.hovered() {
+            tinted(tint, 0x4d)
         } else {
-            (ph::PLAY, "Play", theme::ACCENT)
+            tinted(tint, 0x2e)
         };
-        let btn = egui::Button::new(
-            egui::RichText::new(format!("{glyph} {label}"))
-                .strong()
-                .color(tint),
-        )
-        .fill(tinted(tint, 0x33))
-        .corner_radius(2.0)
-        .min_size(egui::vec2(86.0, 26.0));
-        let resp = ui.add_enabled(self.project.is_some(), btn);
-        if resp.clicked() {
+        p.rect_filled(rect, 2.0, fill);
+
+        // Play zone: launch or stop.
+        let play_rect = egui::Rect::from_min_size(rect.left_top(), egui::vec2(PLAY_W, BTN_H));
+        let text_rect = egui::Rect::from_min_max(
+            play_rect.right_top(),
+            egui::pos2(rect.right() - CHEV_W, rect.bottom()),
+        );
+        let chev_rect = egui::Rect::from_min_max(text_rect.right_top(), rect.right_bottom());
+
+        let play = ui.interact(play_rect, ui.id().with("mega_play"), egui::Sense::CLICK);
+        p.text(
+            play_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::proportional(26.0),
+            if enabled { tint } else { theme::TEXT_DIM },
+        );
+        if enabled && play.clicked() {
             if running {
                 self.stop_instance();
             } else {
                 self.run_instance();
             }
         }
+        play.on_hover_text(if running { "Stop instance" } else { "Run instance" });
+
+        // Label, clipped to its zone (single line, truncate to fit).
+        p.with_clip_rect(text_rect.intersect(rect)).text(
+            egui::pos2(text_rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            galley.text(),
+            font,
+            if enabled { theme::TEXT } else { theme::MUTED },
+        );
+
+        // Subtle vertical divider between label and chevron.
+        let dx = chev_rect.left() - 3.0;
+        p.line_segment(
+            [egui::pos2(dx, rect.top() + 6.0), egui::pos2(dx, rect.bottom() - 6.0)],
+            egui::Stroke::new(1.0, tinted(theme::TEXT, 0x26)),
+        );
+
+        // Dropdown zone: one combined popup with profiles, scenarios and
+        // the launch-settings entry.
+        let chev = ui.interact(chev_rect, ui.id().with("mega_menu"), egui::Sense::CLICK);
+        p.text(
+            chev_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            ph::CARET_DOWN,
+            egui::FontId::proportional(15.0),
+            theme::TEXT,
+        );
+        egui::Popup::menu(&chev).show(|ui| {
+            for id in self.profiles.order.clone() {
+                let Some(pr) = self.profiles.get(&id) else {
+                    continue;
+                };
+                let active = id == self.active_profile;
+                let text = if active {
+                    format!("{}  {}", ph::CHECK, pr.label)
+                } else {
+                    format!("     {}", pr.label)
+                };
+                if ui.selectable_label(active, text).clicked() {
+                    self.active_profile = id;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for s in self.scenarios.clone() {
+                let active = s.id == self.active_scenario;
+                let text = if active {
+                    format!("{}  {}", ph::CHECK, s.label)
+                } else {
+                    format!("     {}", s.label)
+                };
+                if ui.selectable_label(active, text).clicked() {
+                    self.active_scenario = s.id;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui
+                .button(format!("{}  Launch settings", ph::GEAR))
+                .clicked()
+            {
+                self.active_view = View::LaunchSettings;
+                ui.close();
+            }
+        });
+
+        // Run status next to the button: state icon + dim label.
         if running {
-            ui.label(theme::small(run_state_label(&self.run_state)));
+            let (icon, color) = match &self.run_state {
+                RunState::Building => (ph::CIRCLE_NOTCH, theme::YELLOW),
+                RunState::Running => (ph::PULSE, theme::GREEN),
+                RunState::Stopping => (ph::CIRCLE_NOTCH, theme::YELLOW),
+                RunState::Failed(_) => (ph::WARNING, theme::RED),
+                RunState::Idle => (ph::PULSE, theme::MUTED),
+            };
+            ui.label(egui::RichText::new(icon).size(15.0).color(color));
+            ui.label(theme::small(run_state_label(&self.run_state)).color(theme::TEXT_DIM));
         }
 
         ui.separator();
@@ -1009,7 +1091,7 @@ impl eframe::App for StudioApp {
 
         egui::Panel::top("topbar")
             .resizable(false)
-            .exact_size(36.0)
+            .exact_size(44.0)
             .frame(
                 egui::Frame::new()
                     .fill(if self.run_state == RunState::Idle {
@@ -1017,7 +1099,7 @@ impl eframe::App for StudioApp {
                     } else {
                         theme::BAR_ACTIVE
                     })
-                    .inner_margin(egui::Margin::symmetric(8, 3)),
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
             )
             .show(ui, |ui| self.top_bar(ui));
 
@@ -1155,27 +1237,13 @@ fn connect_dot(ui: &mut egui::Ui, state: &ConnState) {
     resp.on_hover_text(conn_label(state));
 }
 
-/// Frameless 18px gear button; returns true when clicked.
-fn gear_button(ui: &mut egui::Ui, tooltip: &str) -> bool {
-    let resp = ui.add(
-        egui::Button::new(
-            egui::RichText::new(ph::GEAR)
-                .size(13.0)
-                .color(theme::TEXT_DIM),
-        )
-        .fill(egui::Color32::TRANSPARENT)
-        .min_size(egui::vec2(18.0, 18.0)),
-    );
-    resp.on_hover_text(tooltip).clicked()
-}
-
-/// Fallback content of the identity icon box: a controller glyph.
-fn glyph_box(ui: &mut egui::Ui, rect: egui::Rect) {
+/// Fallback content of the identity icon: a controller glyph.
+fn glyph_box(ui: &mut egui::Ui, rect: egui::Rect, size: f32) {
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         ph::GAME_CONTROLLER,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(size),
         theme::TEXT_DIM,
     );
 }

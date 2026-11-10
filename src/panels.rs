@@ -352,41 +352,75 @@ fn files_center(ui: &mut egui::Ui, app: &mut StudioApp) {
     }
 
     // Tab strip: flat filename tabs, active tab with a lighter fill.
+    // The close button is laid out inside the tab frame, right-aligned.
     let mut focus: Option<usize> = None;
     let mut close: Option<usize> = None;
-    ui.horizontal(|ui| {
-        for (i, tab) in app.open_tabs.iter().enumerate() {
-            let active = app.active_tab == Some(i);
-            let name = tab
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| tab.rel.clone());
-            let text =
-                egui::RichText::new(format!("{} {name}", file_glyph(&name))).color(if active {
-                    theme::TEXT
+    egui::ScrollArea::horizontal()
+        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            for (i, tab) in app.open_tabs.iter().enumerate() {
+                let active = app.active_tab == Some(i);
+                let name = tab
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| tab.rel.clone());
+                // Truncate long filenames so tabs stay compact.
+                let name = if name.chars().count() > 18 {
+                    format!("{}…", name.chars().take(18).collect::<String>())
                 } else {
-                    theme::TAB_INACTIVE
-                });
-            let resp = ui.add(egui::Button::new(text).fill(if active {
-                theme::CARD
-            } else {
-                egui::Color32::TRANSPARENT
-            }));
-            if resp.clicked() {
-                focus = Some(i);
+                    name
+                };
+                let text =
+                    egui::RichText::new(format!("{} {name}", file_glyph(&name))).color(if active {
+                        theme::TEXT
+                    } else {
+                        theme::TAB_INACTIVE
+                    });
+
+                let mut frame = egui::Frame::new()
+                    .fill(if active {
+                        theme::FIELD
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .corner_radius(2.0)
+                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .begin(ui);
+
+                let mut label: Option<egui::Response> = None;
+                {
+                    let inner = &mut frame.content_ui;
+                    inner.horizontal(|inner| {
+                        label = Some(inner.add(egui::Label::new(text).sense(egui::Sense::click())));
+                        let x = inner.add(egui::Button::new(theme::small(ph::X)).frame(false));
+                        let x = x.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if x.hovered() {
+                            // Brighten the small close glyph on hover.
+                            inner.painter()
+                                .rect_filled(x.rect, 2.0, egui::Color32::from_white_alpha(25));
+                        }
+                        if x.clicked() {
+                            close = Some(i);
+                        }
+                    });
+                }
+
+                let resp = frame.allocate_space(ui);
+                if !active && resp.hovered() {
+                    frame.frame.fill = theme::FIELD.gamma_multiply(0.5);
+                }
+                frame.paint(ui);
+
+                let label = label.expect("tab label added above");
+                if label.clicked() {
+                    focus = Some(i);
+                }
+                if label.middle_clicked() {
+                    close = Some(i);
+                }
             }
-            if resp.middle_clicked() {
-                close = Some(i);
-            }
-            if ui
-                .add(egui::Button::new(theme::small(ph::X)).frame(false))
-                .clicked()
-            {
-                close = Some(i);
-            }
-        }
-    });
+        });
     ui.separator();
 
     if let Some(i) = focus {
