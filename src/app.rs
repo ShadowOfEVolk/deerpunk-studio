@@ -1115,7 +1115,11 @@ impl eframe::App for StudioApp {
             .resizable(true)
             .default_size(250.0)
             .min_size(140.0)
-            .frame(egui::Frame::new().fill(theme::PANEL))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
             .show(ui, |ui| {
                 let view = self.active_view.clone();
                 panels::sidebar(ui, self, &view);
@@ -1138,7 +1142,11 @@ impl eframe::App for StudioApp {
                 .resizable(true)
                 .default_size(220.0)
                 .min_size(80.0)
-                .frame(egui::Frame::new().fill(theme::BG))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BG)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
                 .show(ui, |ui| panels::console_panel(ui, self));
         }
 
