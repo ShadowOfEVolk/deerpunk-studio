@@ -138,7 +138,8 @@ impl PuffinPanel {
             return input.clone();
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(DEFAULT_ADDR));
-        cx.subscribe_in(&input, window, |_, _, _: &InputEvent, _, _| {}).detach();
+        cx.subscribe_in(&input, window, |_, _, _: &InputEvent, _, _| {})
+            .detach();
         self.addr_input = Some(input.clone());
         input
     }
@@ -407,7 +408,10 @@ impl PuffinPanel {
         if width_px <= 0.0 {
             return;
         }
-        let relative = (entry.start_ns - layout.start_ns, entry.end_ns - layout.start_ns);
+        let relative = (
+            entry.start_ns - layout.start_ns,
+            entry.end_ns - layout.start_ns,
+        );
         self.flame.zoom_to(relative, width_px, 0);
         cx.notify();
     }
@@ -460,7 +464,10 @@ impl PuffinPanel {
         let snapshot = self.active();
         let filter = self.flame.filter.clone();
         let key = (
-            snapshot.as_ref().map(|s| std::ptr::from_ref(s.as_ref()) as usize).unwrap_or(0),
+            snapshot
+                .as_ref()
+                .map(|s| std::ptr::from_ref(s.as_ref()) as usize)
+                .unwrap_or(0),
             filter.as_str().to_string(),
         );
         if self.last_stats_key.as_ref() == Some(&key) {
@@ -516,41 +523,39 @@ impl PuffinPanel {
             .min_w_0()
             .overflow_y_scroll()
             .overflow_x_hidden()
-            .child(canvas(|_, _, _| {}, {
-                let snapshot = snapshot.clone();
-                let layout = layout.clone();
-                let opts = opts.clone();
-                let panel = panel.clone();
-                move |bounds, _, window, cx| {
-                    // Remember where the canvas lives for hit-testing next
-                    // frame; no notify (paint-phase mutation only).
-                    let _ = panel.update(cx, |this, _| {
-                        this.flame_bounds = bounds;
-                    });
-                    paint_flamegraph(
-                        &bounds, &snapshot, &layout, &opts, mouse, hovered, window, cx,
-                    );
-                }
-            })
-            .h(content_height)
-            .w_full())
+            .child(
+                canvas(|_, _, _| {}, {
+                    let snapshot = snapshot.clone();
+                    let layout = layout.clone();
+                    let opts = opts.clone();
+                    let panel = panel.clone();
+                    move |bounds, _, window, cx| {
+                        // Remember where the canvas lives for hit-testing next
+                        // frame; no notify (paint-phase mutation only).
+                        let _ = panel.update(cx, |this, _| {
+                            this.flame_bounds = bounds;
+                        });
+                        paint_flamegraph(
+                            &bounds, &snapshot, &layout, &opts, mouse, hovered, window, cx,
+                        );
+                    }
+                })
+                .h(content_height)
+                .w_full(),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.drag_accum = 0.),
             )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                this.on_canvas_mouse_move(ev, cx)
-            }))
-            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
-                this.on_canvas_scroll(ev, cx)
-            }))
+            .on_mouse_move(
+                cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.on_canvas_mouse_move(ev, cx)),
+            )
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| this.on_canvas_scroll(ev, cx)))
             .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| this.on_canvas_click(ev, cx)))
             .on_hover({
                 let panel = panel.clone();
                 move |hovered: &bool, _, cx| {
-                    if !*hovered
-                        && let Some(panel) = panel.upgrade()
-                    {
+                    if !*hovered && let Some(panel) = panel.upgrade() {
                         panel.update(cx, |this, cx| {
                             if this.mouse.take().is_some() {
                                 this.last_mouse = None;
@@ -568,12 +573,19 @@ impl PuffinPanel {
         let layout = self.layout.as_ref()?;
         let opts = &self.flame;
         let mouse = self.canvas_mouse()?;
-        layout.hit_test(opts, self.flame_bounds.size.width.as_f32(), (mouse.x.as_f32(), mouse.y.as_f32()))
+        layout.hit_test(
+            opts,
+            self.flame_bounds.size.width.as_f32(),
+            (mouse.x.as_f32(), mouse.y.as_f32()),
+        )
     }
 
     fn canvas_mouse(&self) -> Option<Point<Pixels>> {
         let mouse = self.mouse?;
-        Some(point(mouse.x - self.flame_bounds.origin.x, mouse.y - self.flame_bounds.origin.y))
+        Some(point(
+            mouse.x - self.flame_bounds.origin.x,
+            mouse.y - self.flame_bounds.origin.y,
+        ))
     }
 
     fn on_canvas_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -854,26 +866,22 @@ impl Render for PuffinPanel {
 
         let zoom_buttons = h_flex()
             .gap_1()
-            .child(
-                Button::new("puffin-zoom-out").label("−").on_click({
-                    let panel = panel.clone();
-                    move |_, _, cx| {
-                        if let Some(panel) = panel.upgrade() {
-                            panel.update(cx, |this, cx| this.zoom(2.0, None, cx));
-                        }
+            .child(Button::new("puffin-zoom-out").label("−").on_click({
+                let panel = panel.clone();
+                move |_, _, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |this, cx| this.zoom(2.0, None, cx));
                     }
-                }),
-            )
-            .child(
-                Button::new("puffin-zoom-in").label("+").on_click({
-                    let panel = panel.clone();
-                    move |_, _, cx| {
-                        if let Some(panel) = panel.upgrade() {
-                            panel.update(cx, |this, cx| this.zoom(0.5, None, cx));
-                        }
+                }
+            }))
+            .child(Button::new("puffin-zoom-in").label("+").on_click({
+                let panel = panel.clone();
+                move |_, _, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |this, cx| this.zoom(0.5, None, cx));
                     }
-                }),
-            )
+                }
+            }))
             .child(
                 Button::new("puffin-zoom-reset")
                     .label(format!("{}", fa::icon(fa::ROTATE)))
@@ -909,27 +917,23 @@ impl Render for PuffinPanel {
             .gap_1()
             .text_sm()
             .text_color(theme::TEXT_DIM)
-            .child(
-                Button::new("puffin-frames-minus").label("−").on_click({
-                    let panel = panel.clone();
-                    move |_, _, cx| {
-                        if let Some(panel) = panel.upgrade() {
-                            panel.update(cx, |this, cx| this.step_frames(-1, cx));
-                        }
+            .child(Button::new("puffin-frames-minus").label("−").on_click({
+                let panel = panel.clone();
+                move |_, _, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |this, cx| this.step_frames(-1, cx));
                     }
-                }),
-            )
+                }
+            }))
             .child(format!("{max_latest} frames"))
-            .child(
-                Button::new("puffin-frames-plus").label("+").on_click({
-                    let panel = panel.clone();
-                    move |_, _, cx| {
-                        if let Some(panel) = panel.upgrade() {
-                            panel.update(cx, |this, cx| this.step_frames(1, cx));
-                        }
+            .child(Button::new("puffin-frames-plus").label("+").on_click({
+                let panel = panel.clone();
+                move |_, _, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |this, cx| this.step_frames(1, cx));
                     }
-                }),
-            );
+                }
+            }));
 
         // Body ------------------------------------------------------------
         let body: AnyElement = if self.view == View::Stats {
@@ -952,17 +956,12 @@ impl Render for PuffinPanel {
                         }),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .p_1()
-                        .child(
-                            DataTable::new(&table)
-                                .stripe(true)
-                                .bordered(false)
-                                .with_size(Size::Size(px(24.))),
-                        ),
+                    div().flex_1().min_h_0().overflow_hidden().p_1().child(
+                        DataTable::new(&table)
+                            .stripe(true)
+                            .bordered(false)
+                            .with_size(Size::Size(px(24.))),
+                    ),
                 )
                 .into_any_element()
         } else if let (Some(snapshot), Some(layout)) = (&snapshot, &layout) {
@@ -1015,7 +1014,12 @@ impl Render for PuffinPanel {
                     .border_b_1()
                     .border_color(theme::BORDER)
                     .child(div().size(px(10.)).rounded_full().bg(dot))
-                    .child(div().text_sm().text_color(theme::TEXT_DIM).child(status_text))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::TEXT_DIM)
+                            .child(status_text),
+                    )
                     .child(
                         div()
                             .w(px(160.))
@@ -1094,13 +1098,7 @@ fn paint_flamegraph(
         // Thread label: "⏷ name" on a dark plate; click toggles collapse.
         let glyph = if thread.collapsed { "⏵ " } else { "⏷ " };
         let label = format!("{glyph}{}", thread.info.name);
-        let label_line = shaped(
-            label.into(),
-            FLAME_FONT_SIZE,
-            white(0.9),
-            window,
-            cx,
-        );
+        let label_line = shaped(label.into(), FLAME_FONT_SIZE, white(0.9), window, cx);
         let label_origin = point(
             bounds.origin.x + px(2.),
             px(bounds.origin.y.as_f32() + thread.label_y()),
@@ -1216,7 +1214,9 @@ fn paint_scope_rect(
     let start_x = x_of(entry.start_ns);
     let stop_x = x_of(entry.end_ns);
     // Offscreen cull (vendor culled by canvas intersection).
-    if stop_x < bounds.origin.x.as_f32() || start_x > bounds.origin.x.as_f32() + bounds.size.width.as_f32() {
+    if stop_x < bounds.origin.x.as_f32()
+        || start_x > bounds.origin.x.as_f32() + bounds.size.width.as_f32()
+    {
         return;
     }
 
@@ -1225,7 +1225,10 @@ fn paint_scope_rect(
         + entry.depth as f32 * (puffin_flame::RECT_HEIGHT + puffin_flame::SPACING);
     let rect = Bounds {
         origin: point(px(start_x), px(top_y)),
-        size: size(px((stop_x - start_x).max(0.1)), px(puffin_flame::RECT_HEIGHT)),
+        size: size(
+            px((stop_x - start_x).max(0.1)),
+            px(puffin_flame::RECT_HEIGHT),
+        ),
     };
 
     let name = details
@@ -1314,10 +1317,7 @@ fn paint_tooltip(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let mut lines: Vec<(String, Hsla)> = vec![(
-        format!("id {}", entry.id.0),
-        theme::TEXT,
-    )];
+    let mut lines: Vec<(String, Hsla)> = vec![(format!("id {}", entry.id.0), theme::TEXT)];
     if let Some(details) = details {
         lines.push((format!("function  {}", details.function_name), theme::TEXT));
         if let Some(scope_name) = &details.scope_name {
@@ -1335,7 +1335,10 @@ fn paint_tooltip(
         ));
     }
     lines.push((
-        format!("duration  {:7.3} ms", puffin_flame::to_ms(entry.duration_ns())),
+        format!(
+            "duration  {:7.3} ms",
+            puffin_flame::to_ms(entry.duration_ns())
+        ),
         theme::TEXT,
     ));
     if entry.merge_pieces > 0 {
@@ -1374,13 +1377,7 @@ fn paint_tooltip(
         BorderStyle::default(),
     ));
     for (ix, (text, color)) in lines.iter().enumerate() {
-        let line = shaped(
-            text.as_str().into(),
-            FLAME_FONT_SIZE,
-            *color,
-            window,
-            cx,
-        );
+        let line = shaped(text.as_str().into(), FLAME_FONT_SIZE, *color, window, cx);
         let y = origin.y.as_f32() + 4.0 + ix as f32 * (FLAME_LINE_HEIGHT.as_f32() + 2.0);
         let _ = line.paint(
             point(origin.x + px(8.), px(y)),
@@ -1397,7 +1394,13 @@ fn paint_tooltip(
 // Text helpers
 // ---------------------------------------------------------------------------
 
-fn shaped(text: SharedString, font_size: Pixels, color: Hsla, window: &Window, cx: &App) -> ShapedLine {
+fn shaped(
+    text: SharedString,
+    font_size: Pixels,
+    color: Hsla,
+    window: &Window,
+    cx: &App,
+) -> ShapedLine {
     let font = Font {
         family: cx.theme().mono_font_family.clone(),
         ..Font::default()
@@ -1410,19 +1413,30 @@ fn shaped(text: SharedString, font_size: Pixels, color: Hsla, window: &Window, c
         underline: None,
         strikethrough: None,
     };
-    window.text_system().shape_line(text, font_size, &[run], None)
+    window
+        .text_system()
+        .shape_line(text, font_size, &[run], None)
 }
 
 /// Shaped line truncated with an ellipsis to fit `max_w` (assignment:
 /// "текст метки с обрезкой (ellipsis)").
-fn fitted(text: &str, max_w: Pixels, font_size: Pixels, color: Hsla, window: &Window, cx: &App) -> ShapedLine {
+fn fitted(
+    text: &str,
+    max_w: Pixels,
+    font_size: Pixels,
+    color: Hsla,
+    window: &Window,
+    cx: &App,
+) -> ShapedLine {
     let line = shaped(text.to_string().into(), font_size, color, window, cx);
     if line.width() <= max_w {
         return line;
     }
     let chars = text.chars().count().max(1) as f32;
     let avg = line.width().as_f32() / chars;
-    let max_chars = ((max_w.as_f32() / avg.max(1.0)) as usize).saturating_sub(1).max(1);
+    let max_chars = ((max_w.as_f32() / avg.max(1.0)) as usize)
+        .saturating_sub(1)
+        .max(1);
     let cut: String = text.chars().take(max_chars).collect::<String>() + "…";
     shaped(cut.into(), font_size, color, window, cx)
 }
@@ -1470,14 +1484,38 @@ impl TableDelegate for StatsDelegate {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         match col_ix {
-            0 => Column::new("location", "Location").width(px(220.)).min_width(px(90.)).sortable(),
-            1 => Column::new("function", "Function Name").width(px(220.)).min_width(px(90.)).sortable(),
-            2 => Column::new("scope_name", "Scope Name").width(px(180.)).min_width(px(80.)).sortable(),
-            3 => Column::new("count", "Count").width(px(70.)).min_width(px(48.)).sortable(),
-            4 => Column::new("size", "Size").width(px(80.)).min_width(px(56.)).sortable(),
-            5 => Column::new("total", "Total self").width(px(110.)).min_width(px(72.)).sortable(),
-            6 => Column::new("mean", "Mean self").width(px(100.)).min_width(px(72.)).sortable(),
-            _ => Column::new("max", "Max self").width(px(100.)).min_width(px(72.)).sortable(),
+            0 => Column::new("location", "Location")
+                .width(px(220.))
+                .min_width(px(90.))
+                .sortable(),
+            1 => Column::new("function", "Function Name")
+                .width(px(220.))
+                .min_width(px(90.))
+                .sortable(),
+            2 => Column::new("scope_name", "Scope Name")
+                .width(px(180.))
+                .min_width(px(80.))
+                .sortable(),
+            3 => Column::new("count", "Count")
+                .width(px(70.))
+                .min_width(px(48.))
+                .sortable(),
+            4 => Column::new("size", "Size")
+                .width(px(80.))
+                .min_width(px(56.))
+                .sortable(),
+            5 => Column::new("total", "Total self")
+                .width(px(110.))
+                .min_width(px(72.))
+                .sortable(),
+            6 => Column::new("mean", "Mean self")
+                .width(px(100.))
+                .min_width(px(72.))
+                .sortable(),
+            _ => Column::new("max", "Max self")
+                .width(px(100.))
+                .min_width(px(72.))
+                .sortable(),
         }
     }
 
@@ -1555,13 +1593,25 @@ impl TableDelegate for StatsDelegate {
                 };
                 cell(format!("{:>5}", stats.count), color)
             }
-            4 => cell(format!("{:>6.1} kB", stats.bytes as f32 * 1e-3), theme::TEXT),
-            5 => cell(format!("{:>8.1} µs", stats.total_self_ns as f32 * 1e-3), theme::TEXT),
-            6 => cell(
-                format!("{:>8.1} µs", stats.total_self_ns as f32 * 1e-3 / stats.count as f32),
+            4 => cell(
+                format!("{:>6.1} kB", stats.bytes as f32 * 1e-3),
                 theme::TEXT,
             ),
-            _ => cell(format!("{:>8.1} µs", stats.max_ns as f32 * 1e-3), theme::TEXT),
+            5 => cell(
+                format!("{:>8.1} µs", stats.total_self_ns as f32 * 1e-3),
+                theme::TEXT,
+            ),
+            6 => cell(
+                format!(
+                    "{:>8.1} µs",
+                    stats.total_self_ns as f32 * 1e-3 / stats.count as f32
+                ),
+                theme::TEXT,
+            ),
+            _ => cell(
+                format!("{:>8.1} µs", stats.max_ns as f32 * 1e-3),
+                theme::TEXT,
+            ),
         }
     }
 
@@ -1576,9 +1626,12 @@ impl TableDelegate for StatsDelegate {
             5 => return Some(format!("{:>8.1} µs", row.stats.total_self_ns as f32 * 1e-3).into()),
             6 => {
                 return Some(
-                    format!("{:>8.1} µs", row.stats.total_self_ns as f32 * 1e-3 / row.stats.count as f32)
-                        .into(),
-                )
+                    format!(
+                        "{:>8.1} µs",
+                        row.stats.total_self_ns as f32 * 1e-3 / row.stats.count as f32
+                    )
+                    .into(),
+                );
             }
             _ => return Some(format!("{:>8.1} µs", row.stats.max_ns as f32 * 1e-3).into()),
         };

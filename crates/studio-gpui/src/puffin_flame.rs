@@ -375,8 +375,7 @@ impl FlameLayout {
     /// Pixel x range of a scope under the current zoom/pan.
     fn scope_x(&self, opts: &FlameOptions, canvas_width_px: f32, e: &ScopeEntry) -> (f32, f32) {
         let scale = canvas_width_px / opts.canvas_width_ns as f32;
-        let x =
-            |ns: NanoSecond| opts.sideways_pan_px + (ns - self.start_ns) as f32 * scale;
+        let x = |ns: NanoSecond| opts.sideways_pan_px + (ns - self.start_ns) as f32 * scale;
         (x(e.start_ns), x(e.end_ns))
     }
 
@@ -401,17 +400,12 @@ impl FlameLayout {
                 continue;
             }
             let depth = ((mouse.1 - row_top) / (RECT_HEIGHT + SPACING)) as usize;
-            return self
-                .scopes
-                .iter()
-                .position(|e| {
-                    e.thread_ix == thread_ix
-                        && e.depth == depth
-                        && {
-                            let (x0, x1) = self.scope_x(opts, canvas_width_px, e);
-                            mouse.0 >= x0 && mouse.0 < x1
-                        }
-                });
+            return self.scopes.iter().position(|e| {
+                e.thread_ix == thread_ix && e.depth == depth && {
+                    let (x0, x1) = self.scope_x(opts, canvas_width_px, e);
+                    mouse.0 >= x0 && mouse.0 < x1
+                }
+            });
         }
         None
     }
@@ -427,7 +421,13 @@ impl FlameLayout {
 
 /// Pre-order walk of a raw scope subtree (vendor `paint_scope` recursion):
 /// parent pushed before its children.
-fn walk_raw(stream: &Stream, scope: &Scope, depth: usize, thread_ix: usize, out: &mut Vec<ScopeEntry>) {
+fn walk_raw(
+    stream: &Stream,
+    scope: &Scope,
+    depth: usize,
+    thread_ix: usize,
+    out: &mut Vec<ScopeEntry>,
+) {
     let children: Vec<Scope> = Reader::with_offset(stream, scope.child_begin_position)
         .and_then(|r| r.read_top_scopes())
         .unwrap_or_default();
@@ -447,7 +447,12 @@ fn walk_raw(stream: &Stream, scope: &Scope, depth: usize, thread_ix: usize, out:
 }
 
 /// Pre-order walk of a merged scope subtree (vendor `paint_merge_scope`).
-fn walk_merge(merge: &MergeScope, parent_start_ns: NanoSecond, thread_ix: usize, out: &mut Vec<ScopeEntry>) {
+fn walk_merge(
+    merge: &MergeScope,
+    parent_start_ns: NanoSecond,
+    thread_ix: usize,
+    out: &mut Vec<ScopeEntry>,
+) {
     let start_ns = parent_start_ns + merge.relative_start_ns;
     let end_ns = start_ns + merge.duration_per_frame_ns;
     for child in &merge.children {
@@ -589,7 +594,9 @@ pub fn build_stat_rows(
                 .as_ref()
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            if !filter.is_empty() && !filter.include(&details.function_name) && !filter.include(&name)
+            if !filter.is_empty()
+                && !filter.include(&details.function_name)
+                && !filter.include(&name)
             {
                 return None;
             }
@@ -615,8 +622,9 @@ pub fn sort_rows(rows: &mut [StatRow], order: SortOrder) {
         SortKey::Count => rows.sort_by_key(|r| r.stats.count),
         SortKey::Size => rows.sort_by_key(|r| r.stats.bytes),
         SortKey::TotalSelfTime => rows.sort_by_key(|r| r.stats.total_self_ns),
-        SortKey::MeanSelfTime => rows
-            .sort_by_key(|r| r.stats.total_self_ns / r.stats.count.max(1) as NanoSecond),
+        SortKey::MeanSelfTime => {
+            rows.sort_by_key(|r| r.stats.total_self_ns / r.stats.count.max(1) as NanoSecond)
+        }
         SortKey::MaxSelfTime => rows.sort_by_key(|r| r.stats.max_ns),
     }
     if order.rev {
@@ -626,9 +634,9 @@ pub fn sort_rows(rows: &mut [StatRow], order: SortOrder) {
 
 /// (total bytes, total self ns) caption line above the table.
 pub fn stats_totals(stats: &BTreeMap<ScopeId, ScopeStats>) -> (usize, NanoSecond) {
-    stats
-        .values()
-        .fold((0usize, 0i64), |(b, ns), s| (b + s.bytes, ns + s.total_self_ns))
+    stats.values().fold((0usize, 0i64), |(b, ns), s| {
+        (b + s.bytes, ns + s.total_self_ns)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -673,13 +681,15 @@ pub fn color_from_duration(ns: NanoSecond) -> (f32, f32, f32, f32) {
 
 #[cfg(test)]
 mod tests {
-    use puffin::{NanoSecond, ScopeCollection, ScopeId, Stream, StreamInfo, ThreadInfo, UnpackedFrameData};
+    use puffin::{
+        NanoSecond, ScopeCollection, ScopeId, Stream, StreamInfo, ThreadInfo, UnpackedFrameData,
+    };
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
     use crate::puffin_flame::{
-        Filter, FlameLayout, FlameOptions, ScopeStats, SortKey, SortOrder, StatRow, SelectedFrames,
+        Filter, FlameLayout, FlameOptions, ScopeStats, SelectedFrames, SortKey, SortOrder, StatRow,
         build_stat_rows, collect_scope_stats, color_from_duration, grid_text, sort_rows,
         stats_totals,
     };
@@ -700,12 +710,15 @@ mod tests {
     fn write_scope(
         s: &mut Stream,
         spec: (u32, &str, NanoSecond, NanoSecond),
-        children: &[((u32, &str, NanoSecond, NanoSecond), Vec<(u32, &str, NanoSecond, NanoSecond)>)],
+        children: &[(
+            (u32, &str, NanoSecond, NanoSecond),
+            Vec<(u32, &str, NanoSecond, NanoSecond)>,
+        )],
     ) -> usize {
         let (off, _) = s.begin_scope(|| spec.2, scope_id(spec.0), spec.1);
         for child in children {
-            let (child_off, _) = s.begin_scope(|| child.0 .2, scope_id(child.0 .0), child.0 .1);
-            s.end_scope(child_off, child.0 .3);
+            let (child_off, _) = s.begin_scope(|| child.0.2, scope_id(child.0.0), child.0.1);
+            s.end_scope(child_off, child.0.3);
         }
         s.end_scope(off, spec.3);
         off
@@ -768,9 +781,9 @@ mod tests {
                     (9, data, start + 10, start + 30),
                     (9, data, start + 40, start + 80),
                 ]
-                    .iter()
-                    .map(|&c| (c, vec![]))
-                    .collect::<Vec<_>>(),
+                .iter()
+                .map(|&c| (c, vec![]))
+                .collect::<Vec<_>>(),
             );
             frame(i as u64, &th, StreamInfo::parse(s).expect("parse"))
         };
@@ -856,16 +869,38 @@ mod tests {
                 max_ns: ns,
             },
         };
-        let mut rows = vec![mk("a", "fa", 2, 100), mk("b", "fb", 9, 300), mk("c", "fc", 5, 200)];
+        let mut rows = vec![
+            mk("a", "fa", 2, 100),
+            mk("b", "fb", 9, 300),
+            mk("c", "fc", 5, 200),
+        ];
 
-        sort_rows(&mut rows, SortOrder { key: SortKey::Count, rev: true });
+        sort_rows(
+            &mut rows,
+            SortOrder {
+                key: SortKey::Count,
+                rev: true,
+            },
+        );
         assert_eq!(rows[0].function_name, "fb");
         assert_eq!(rows[2].function_name, "fa");
 
-        sort_rows(&mut rows, SortOrder { key: SortKey::Count, rev: false });
+        sort_rows(
+            &mut rows,
+            SortOrder {
+                key: SortKey::Count,
+                rev: false,
+            },
+        );
         assert_eq!(rows[0].function_name, "fa");
 
-        sort_rows(&mut rows, SortOrder { key: SortKey::FunctionName, rev: false });
+        sort_rows(
+            &mut rows,
+            SortOrder {
+                key: SortKey::FunctionName,
+                rev: false,
+            },
+        );
         assert_eq!(rows[0].function_name, "fa");
         assert_eq!(rows[2].function_name, "fc");
     }
@@ -873,9 +908,8 @@ mod tests {
     #[test]
     fn layout_height_and_hit_test() {
         let frames = simple_frames(1);
-        let sel =
-            SelectedFrames::try_from_iter(&ScopeCollection::default(), frames.into_iter())
-                .expect("frames");
+        let sel = SelectedFrames::try_from_iter(&ScopeCollection::default(), frames.into_iter())
+            .expect("frames");
         let opts = FlameOptions::default();
         let layout = FlameLayout::build(&sel, &opts);
 
@@ -894,28 +928,51 @@ mod tests {
         assert_eq!(opts.canvas_width_ns, 100.0);
 
         // Top scope [0,100)ns sits at [0,100)px; child at [10,50)px.
-        let hit_top = layout.hit_test(&opts, canvas_w, (30.0, layout.threads[0].scopes_top_y + 2.0));
+        let hit_top = layout.hit_test(
+            &opts,
+            canvas_w,
+            (30.0, layout.threads[0].scopes_top_y + 2.0),
+        );
         assert_eq!(hit_top, Some(0));
-        let hit_child =
-            layout.hit_test(&opts, canvas_w, (20.0, layout.threads[0].scopes_top_y + 20.0 + 2.0));
+        let hit_child = layout.hit_test(
+            &opts,
+            canvas_w,
+            (20.0, layout.threads[0].scopes_top_y + 20.0 + 2.0),
+        );
         assert_eq!(hit_child, Some(1));
         let e = &layout.scopes[0];
         assert_eq!(
-            ((e.start_ns - layout.start_ns) as f32, (e.end_ns - layout.start_ns) as f32),
+            (
+                (e.start_ns - layout.start_ns) as f32,
+                (e.end_ns - layout.start_ns) as f32
+            ),
             (0.0, 100.0)
         );
 
         // Outside the child's x range on its row → None.
         assert_eq!(
-            layout.hit_test(&opts, canvas_w, (60.0, layout.threads[0].scopes_top_y + 20.0 + 2.0)),
+            layout.hit_test(
+                &opts,
+                canvas_w,
+                (60.0, layout.threads[0].scopes_top_y + 20.0 + 2.0)
+            ),
             None
         );
         // Below the thread block → None.
-        assert_eq!(layout.hit_test(&opts, canvas_w, (30.0, layout.height + 100.0)), None);
+        assert_eq!(
+            layout.hit_test(&opts, canvas_w, (30.0, layout.height + 100.0)),
+            None
+        );
 
         // Thread label click zone.
-        assert_eq!(layout.hit_thread_label((10.0, layout.threads[0].label_y() + 2.0)), Some(0));
-        assert_eq!(layout.hit_thread_label((10.0, layout.threads[0].scopes_top_y + 2.0)), None);
+        assert_eq!(
+            layout.hit_thread_label((10.0, layout.threads[0].label_y() + 2.0)),
+            Some(0)
+        );
+        assert_eq!(
+            layout.hit_thread_label((10.0, layout.threads[0].scopes_top_y + 2.0)),
+            None
+        );
     }
 
     #[test]

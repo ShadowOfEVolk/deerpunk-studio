@@ -26,8 +26,8 @@ use syntect::highlighting::{
 };
 use syntect::parsing::SyntaxSet;
 
-use deerpunk_studio::assets::{AssetKind, fmt_size};
 use crate::rml as rml_doc;
+use deerpunk_studio::assets::{AssetKind, fmt_size};
 
 use crate::state::StudioState;
 use crate::theme;

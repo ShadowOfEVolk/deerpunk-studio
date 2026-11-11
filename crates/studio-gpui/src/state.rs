@@ -638,8 +638,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use deerpunk_studio::ansi::Stream;
     use super::Scenario;
+    use deerpunk_studio::ansi::Stream;
     use deerpunk_studio::config::StudioConfig;
     use deerpunk_studio::mcp::McpManager;
     use deerpunk_studio::net::{ConnState, NetClient};
