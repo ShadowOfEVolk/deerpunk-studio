@@ -1585,6 +1585,7 @@ dependencies = [
  "bincode",
  "bindgen 0.71.1",
  "bitflags 2.13.2",
+ "bytemuck",
  "cc",
  "ciborium",
  "deerpunk-engine-ffi",
@@ -1614,6 +1615,25 @@ name = "deerpunk-engine-network"
 version = "0.1.0"
 dependencies = [
  "socket2 0.5.10",
+]
+
+[[package]]
+name = "deerpunk-engine-renderer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cc",
+ "deerpunk-engine-common",
+ "deerpunk-engine-ffi",
+ "glam 0.33.12",
+ "inventory",
+ "log",
+ "naga",
+ "pollster 0.4.0",
+ "raw-window-handle",
+ "tiny-skia",
+ "wgpu",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -7375,12 +7395,14 @@ name = "studio-gpui"
 version = "0.1.0"
 dependencies = [
  "deerpunk-engine-common",
+ "deerpunk-engine-renderer",
  "deerpunk-studio",
  "deerpunk-ui",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "pollster 0.4.0",
  "puffin",
  "puffin_http",
  "quick-xml 0.41.0",
@@ -7388,6 +7410,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "toml 1.2.1+spec-1.1.0",
+ "wgpu",
 ]
 
 [[package]]

@@ -11,7 +11,12 @@ path = "src/main.rs"
 gpui-kit = "0.9.1"
 deerpunk-studio = { path = "../.." }
 deerpunk-engine-common = { path = "../../../deerpunk/crates/engine-common" }
+deerpunk-engine-renderer = { path = "../../../deerpunk/crates/engine-renderer" }
 deerpunk-ui = { path = "../../../deerpunk/crates/engine-ui" }
+# GPU rasterization of the RmlUi preview via the engine's UiPass; wgpu must
+# be exactly the engine's major (type unification with deerpunk-engine-renderer).
+wgpu = "30"
+pollster = "0.4"
 image = "0.25.10"
 quick-xml = { version = "0.41", default-features = false }
 rfd = "0.18.0"

@@ -1,8 +1,10 @@
 //! Rmlui panel (center tab): live RmlUi preview. Port of the egui viewer
 //! (src/viewers/rmlui.rs): the engine's `deerpunk-ui` runtime loads the
 //! open document with the real asset resolver (RCSS, fonts, `ui://` refs —
-//! exactly like in-game) and its draw lists are software-rasterized into a
-//! gpui [`RenderImage`] via the [`raster`] module. The panel owns the
+//! exactly like in-game) and its draw lists are rasterized into a gpui
+//! [`RenderImage`] — on the GPU through the engine's own wgpu `UiPass`
+//! ([`gpu_raster`], offscreen, the game's `shaders/ui.wgsl`), with the
+//! in-app software rasterizer ([`raster`]) as fallback. The panel owns the
 //! session (RmlUi is process-global; this panel is the only in-process
 //! owner — the egui version used a static for the same reason).
 
@@ -22,6 +24,10 @@ use crate::theme;
 #[path = "raster.rs"]
 mod raster;
 
+#[path = "gpu_raster.rs"]
+mod gpu_raster;
+
+use gpu_raster::GpuRaster;
 use raster::RasterCache;
 
 /// Smallest usable preview surface; smaller panes downscale from this.
@@ -46,6 +52,10 @@ enum Session {
         file: PathBuf,
         mtime: Option<SystemTime>,
         cache: RasterCache,
+        /// GPU rasterizer over the engine's `UiPass`; `None` (no adapter,
+        /// missing shader, or a runtime error) sticks to the CPU
+        /// [`RasterCache`] until the session is rebuilt.
+        gpu: Option<GpuRaster>,
         screen: (u32, u32),
         image: Option<Arc<RenderImage>>,
         image_size: [u32; 2],
@@ -219,6 +229,9 @@ impl RmluiPanel {
                 return Err(self.mark_failed(base, file, LOAD_FAILED.into()));
             };
             doc.show();
+            // Shader root is the gamedir — the parent of the `ui` asset
+            // root (`<gamedir>/shaders/ui.wgsl`, the engine's SHADER_DIR).
+            let gpu = GpuRaster::new(base.parent().unwrap_or(base.as_path()));
             self.session = Some(Session::Ready {
                 runtime,
                 doc,
@@ -226,6 +239,7 @@ impl RmluiPanel {
                 file: file.to_path_buf(),
                 mtime,
                 cache: RasterCache::default(),
+                gpu,
                 screen: target,
                 image: None,
                 image_size: [0, 0],
@@ -257,6 +271,7 @@ impl RmluiPanel {
             .expect("session is Ready after the rebuild block");
         let Session::Ready {
             cache,
+            gpu,
             image,
             image_size,
             ..
@@ -273,7 +288,22 @@ impl RmluiPanel {
             cache.screen()
         };
         if fresh.is_some() || *image_size != shown {
-            let buf = cache.raster(shown[0], shown[1]);
+            // GPU first; the first runtime error pins the CPU fallback for
+            // the session — no per-frame adapter retries.
+            let gpu_buf = match gpu {
+                Some(g) => match g.raster(fresh.as_ref(), shown) {
+                    Some(buf) => Some(buf),
+                    None => {
+                        *gpu = None;
+                        eprintln!(
+                            "rmlui preview: gpu raster failed — CPU fallback for this session"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let buf = gpu_buf.unwrap_or_else(|| cache.raster(shown[0], shown[1]));
             let buf = image::RgbaImage::from_raw(shown[0], shown[1], buf)
                 .expect("raster buffer dimensions match");
             *image = Some(Arc::new(RenderImage::new([image::Frame::new(buf)])));
