@@ -13,11 +13,20 @@ libc = "0.2.191"
 puffin_http = "0.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-deerpunk-engine-common = { path = "../deerpunk/crates/engine-common" }
-deerpunk-ui = { path = "../deerpunk/crates/engine-ui" }
+deerpunk-engine-common = { git = "https://github.com/ShadowOfEVolk/deerpunk" }
+deerpunk-ui = { git = "https://github.com/ShadowOfEVolk/deerpunk" }
 toml = "1.2.1"
 tungstenite = "0.30.0"
 walkdir = "2.5.0"
+
+# Local engine checkout overrides the git dependency for development:
+# uncommitted engine work is picked up verbatim, and first builds reuse the
+# already-configured 3rdparty/ submodules (RmlUi, freetype, lua) instead of
+# re-cloning them into the cargo git checkout.
+[patch."https://github.com/ShadowOfEVolk/deerpunk"]
+deerpunk-engine-common = { path = "../deerpunk/crates/engine-common" }
+deerpunk-ui = { path = "../deerpunk/crates/engine-ui" }
+deerpunk-engine-renderer = { path = "../deerpunk/crates/engine-renderer" }
 
 # Optimize GPUI framework deps in dev builds (docs/installation recommendation).
 [profile.dev.package]

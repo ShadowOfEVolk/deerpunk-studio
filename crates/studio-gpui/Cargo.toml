@@ -10,9 +10,9 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit = "0.9.1"
 deerpunk-studio = { path = "../.." }
-deerpunk-engine-common = { path = "../../../deerpunk/crates/engine-common" }
-deerpunk-engine-renderer = { path = "../../../deerpunk/crates/engine-renderer" }
-deerpunk-ui = { path = "../../../deerpunk/crates/engine-ui" }
+deerpunk-engine-common = { git = "https://github.com/ShadowOfEVolk/deerpunk" }
+deerpunk-engine-renderer = { git = "https://github.com/ShadowOfEVolk/deerpunk" }
+deerpunk-ui = { git = "https://github.com/ShadowOfEVolk/deerpunk" }
 # GPU rasterization of the RmlUi preview via the engine's UiPass; wgpu must
 # be exactly the engine's major (type unification with deerpunk-engine-renderer).
 wgpu = "30"

@@ -2,20 +2,44 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    # The engine lives in a sibling checkout. Cargo declares the engine crates
+    # as git dependencies of this repo, with a `[patch]` override back to
+    # `../deerpunk` so the build uses the checked-out engine (and its
+    # initialized 3rdparty submodules: RmlUi, freetype, lua — the git checkout
+    # cargo creates for a dependency never has submodules).
+    - name: Checkout engine (sibling, with submodules)
+      uses: actions/checkout@v4
+      with:
+        repository: ShadowOfEVolk/deerpunk
+        ref: main
+        path: deerpunk
+        submodules: recursive
+
+    - name: Install system dependencies (cmake/bindgen/GL)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake clang libclang-dev pkg-config \
+          libxkbcommon-dev libx11-dev libwayland-dev \
+          libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev
+
+    - name: Symlink engine checkout where the [patch] expects it
+      run: ln -s "$GITHUB_WORKSPACE/deerpunk" "$GITHUB_WORKSPACE/../deerpunk"
+
     - name: Build
       run: cargo build --workspace --verbose
     - name: Run tests
