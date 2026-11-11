@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use deerpunk_engine_common::ui_draw::{UiDraw, UiFrame, UiTextureUpload, UiVertex};
-use deerpunk_ui::{DataModelValue, UiDirAssets, UiRuntime, drain_commands};
+use deerpunk_ui::{DataModelValue, UiDirAssets, UiDocument, UiRuntime, drain_commands};
 
 const USAGE: &str = "\
 usage: deerpunk-studio shot <file.rml> [options]
@@ -62,25 +62,11 @@ pub fn run(args: &[String]) -> i32 {
     // so explicit state wins.
     let mut state_fields = 0usize;
     if let Some(path) = &opts.state {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("shot: cannot read {}: {e}", path.display());
+        match inject_state_file(&doc, path) {
+            Ok(n) => state_fields = n,
+            Err(reason) => {
+                eprintln!("shot: {reason}");
                 return 1;
-            }
-        };
-        let table: toml::Table = match toml::from_str(&text) {
-            Ok(table) => table,
-            Err(e) => {
-                eprintln!("shot: invalid TOML in {}: {e}", path.display());
-                return 1;
-            }
-        };
-        for (field, value) in toml_to_state(&table) {
-            if doc.data_model_set(&field, value) {
-                state_fields += 1;
-            } else {
-                eprintln!("shot: warning: data model rejected field {field:?}");
             }
         }
     }
@@ -140,12 +126,29 @@ struct ShotOpts {
     frames: u32,
 }
 
-/// Hand-rolled parse: one positional plus `--state`, `-o`/`--out`, `--size`,
-/// `--frames`.
+/// Read a flat TOML state file and inject it into `doc`'s data model
+/// (shared by the `shot` and `tree` commands). Returns the number of applied
+/// fields; rejected fields warn on stderr and are skipped.
+pub(crate) fn inject_state_file(doc: &UiDocument, path: &Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let table: toml::Table = toml::from_str(&text)
+        .map_err(|e| format!("invalid TOML in {}: {e}", path.display()))?;
+    let mut applied = 0usize;
+    for (field, value) in toml_to_state(&table) {
+        if doc.data_model_set(&field, value) {
+            applied += 1;
+        } else {
+            eprintln!("warning: data model rejected field {field:?}");
+        }
+    }
+    Ok(applied)
+}
+
 /// UI asset root for `rml`: its nearest ancestor directory named `ui` —
 /// the engine's layout (`<gamedir>/ui/…`) — falling back to the file's
 /// parent (same rule as the gpui live preview).
-fn base_for(rml: &Path) -> PathBuf {
+pub(crate) fn base_for(rml: &Path) -> PathBuf {
     rml.ancestors()
         .skip(1) // a file *named* `ui` is not its own base directory
         .find(|p| p.file_name().is_some_and(|n| n == "ui"))
@@ -188,7 +191,7 @@ fn parse_args(argv: &[String]) -> Result<ShotOpts, String> {
 }
 
 /// Value of the flag at `i`; advances `i` past it.
-fn value(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+pub(crate) fn value(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     match argv.get(*i + 1) {
         Some(v) => {
             *i += 1;

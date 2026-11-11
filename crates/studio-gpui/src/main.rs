@@ -29,9 +29,10 @@ const WINDOW_TITLE: &str = "deerpunk studio";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("shot") {
-        let code = deerpunk_studio::widgetshot::run(&args[1..]);
-        std::process::exit(code);
+    match args.first().map(String::as_str) {
+        Some("shot") => std::process::exit(deerpunk_studio::widgetshot::run(&args[1..])),
+        Some("tree") => std::process::exit(deerpunk_studio::widgettree::run(&args[1..])),
+        _ => {}
     }
     application().with_assets(assets::Assets).run(|cx| {
         // The FA icon font must be in the text system before anything

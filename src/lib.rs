@@ -17,3 +17,4 @@ pub mod protocol;
 pub mod pty;
 pub mod runner;
 pub mod widgetshot;
+pub mod widgettree;

@@ -892,3 +892,185 @@ fn render_live_rows_click() {
         "clicking a row changed only {diff} pixels: the list did not re-render its selection"
     );
 }
+
+// ===== RmlUi preview: canvas grid, zoom/fit, DataModel panel =====
+//
+// RmlUi is process-global, so the whole preview smoke stays one test. It
+// previews the fixture project (tests/fixtures/ui — fonts/font.ttf, one of
+// the exact names engine-ui registers, and widgets/binding_test.rml) in a
+// headless window and asserts on rasterized pixels: the widget paints with
+// RmlUi's own font engine (real glyph pixels even under NoopTextSystem),
+// the canvas paints the grid around/behind the fitted frame, zoom scales
+// the widget, and the DataModel panel column renders next to it.
+
+#[test]
+fn rmlui_canvas_grid_zoom_and_bindings() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    render_rmlui_canvas();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    eprintln!("rmlui canvas: skipped; GPUI has no headless renderer on this platform");
+}
+
+/// Pixels within `tol` per channel of `rgb` in the column strip
+/// `x0..x1`, full height.
+fn count_near(shot: &RgbaImage, x0: u32, x1: u32, rgb: [u8; 3], tol: i32) -> usize {
+    let mut n = 0usize;
+    for y in 0..shot.height() {
+        for x in x0..x1.min(shot.width()) {
+            let p = shot.get_pixel(x, y).0;
+            if (p[0] as i32 - rgb[0] as i32).abs() <= tol
+                && (p[1] as i32 - rgb[1] as i32).abs() <= tol
+                && (p[2] as i32 - rgb[2] as i32).abs() <= tol
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render_rmlui_canvas() {
+    use gpui_kit::{
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, point, px, size,
+    };
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui");
+    let rml_path = fixture.join("widgets/binding_test.rml");
+    let rel = "widgets/binding_test.rml".to_string();
+
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+
+    let state = cx.update(|cx| cx.new(|_| state::StudioState::new()));
+    let (window, panel) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|cx| rmlui::RmluiPanel::new(state.clone(), cx)),
+            )
+            .expect("open headless rmlui window")
+        });
+
+    cx.update(|cx| panel.update(cx, |p, cx| p.open(rml_path.clone(), rel.clone(), cx)));
+
+    let draw = |cx: &mut gpui_kit::HeadlessAppContext, window| -> image::RgbaImage {
+        cx.update_window(window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .expect("render rmlui frame");
+        cx.capture_screenshot(window).expect("capture rmlui frame")
+    };
+
+    // Two frames: the open applies on the first render and the canvas paint
+    // callback pins the canvas bounds; the second frame paints with them
+    // (matching the live repaint cadence).
+    let _ = draw(&mut cx, window);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let shot_fit = draw(&mut cx, window);
+    let (w, h) = (shot_fit.width(), shot_fit.height());
+    let canvas_w = w - 280; // canvas area = row left of the DataModel panel
+
+    // Widget painted: the fixture body fill (rgb(38,52,80)) must cover a
+    // large area — the 400×300 doc rect at the fit scale.
+    let body_fit = count_near(&shot_fit, 0, canvas_w, [38, 52, 80], 6);
+    assert!(
+        body_fit >= 50_000,
+        "widget body painted only {body_fit} px: the preview did not render"
+    );
+
+    // Grid painted: canvas pixels that are neither the theme background nor
+    // widget colors — the grid lines around and behind the fitted frame
+    // (minors #6e6682, majors #3a3344, theme BG #1e1a24). The fixture
+    // document is 400×300 of a ~920×770 screen, so most of the canvas shows
+    // grid.
+    let bg = [30, 26, 36];
+    let widget = [[38, 52, 80], [90, 60, 110], [167, 139, 250], [60, 110, 90]];
+    let near_any = |p: &[u8; 4]| {
+        (0..3).all(|c| (p[c] as i32 - bg[c] as i32).abs() <= 4)
+            || widget
+                .iter()
+                .any(|rgb| (0..3).all(|c| (p[c] as i32 - rgb[c] as i32).abs() <= 6))
+    };
+    let mut grid_px = 0usize;
+    let mut grid_colors = HashSet::new();
+    for y in 26..h {
+        for x in 0..canvas_w {
+            let p = shot_fit.get_pixel(x, y).0;
+            if !near_any(&p) && p[3] == 255 {
+                grid_px += 1;
+                grid_colors.insert(p);
+            }
+        }
+    }
+    assert!(
+        grid_px >= 1_500,
+        "grid painted only {grid_px} px: no grid lines around the preview"
+    );
+    assert!(
+        grid_colors.len() >= 2,
+        "grid has {} distinct colors: minor and major tiers did not both render",
+        grid_colors.len()
+    );
+
+    // Zoom 2x anchored inside the widget box (the exact handler the wheel
+    // runs): the widget's painted area must grow substantially.
+    cx.update_window(window, |_, _, cx| {
+        panel.update(cx, |p, cx| {
+            p.zoom_at_cursor(point(px(150.), px(150.)), 2.0, cx)
+        })
+    })
+    .expect("zoom");
+    let shot_zoom = draw(&mut cx, window);
+    let body_zoom = count_near(&shot_zoom, 0, canvas_w, [38, 52, 80], 6);
+    assert!(
+        body_zoom >= body_fit * 3 / 2,
+        "zoom did not scale the widget up ({body_fit} → {body_zoom} px)"
+    );
+
+    // Double-click fit (the same body the click handler runs): back to the
+    // fitted view.
+    cx.update_window(window, |_, _, cx| panel.update(cx, |p, cx| p.reset_view(cx)))
+        .expect("reset view");
+    let shot_reset = draw(&mut cx, window);
+    let body_reset = count_near(&shot_reset, 0, canvas_w, [38, 52, 80], 6);
+    assert!(
+        body_reset >= body_fit * 3 / 4 && body_reset <= body_fit * 5 / 4,
+        "fit-to-pane did not restore the fitted view ({body_fit} → {body_reset} px)"
+    );
+
+    // DataModel panel painted: the fixed right column must carry the panel
+    // background plus section headers/row separators (≥2 colors; text is
+    // noop under NoopTextSystem).
+    let mut panel_colors = HashSet::new();
+    for y in h / 4..3 * h / 4 {
+        for x in (canvas_w + 1)..w {
+            panel_colors.insert(shot_fit.get_pixel(x, y).0);
+        }
+    }
+    assert!(
+        panel_colors.len() >= 2,
+        "DataModel panel column is uniform ({} colors): it did not render",
+        panel_colors.len()
+    );
+}
