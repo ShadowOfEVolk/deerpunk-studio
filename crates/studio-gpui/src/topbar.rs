@@ -141,6 +141,9 @@ impl Render for TopBar {
             RunState::Running => (fa::ACTIVITY, theme::GREEN),
             RunState::Failed(_) => (fa::CIRCLE_EXCLAMATION, theme::RED),
         };
+        // Building/Stopping get the *rotating* ring (fa::spinner); the
+        // other states keep their static glyph unchanged.
+        let run_active = matches!(&state.run_state, RunState::Building | RunState::Stopping);
 
         let profile_label = state
             .profiles
@@ -268,7 +271,11 @@ impl Render for TopBar {
             .child(
                 div()
                     .text_color(if has_project { tint } else { theme::TEXT_DIM })
-                    .child(fa::sized(glyph, px(16.))),
+                    .child(if run_active {
+                        fa::spinner(px(16.), tint, "play-spinner", true)
+                    } else {
+                        fa::sized(glyph, px(16.))
+                    }),
             )
             .disabled(!has_project)
             .tooltip(if running {
@@ -494,9 +501,7 @@ fn menu_row(
                 .w(px(14.))
                 .flex_shrink_0()
                 .text_color(theme::ACCENT)
-                .when(checked, |this| {
-                    this.child(fa::sized(fa::CHECK, px(12.)))
-                }),
+                .when(checked, |this| this.child(fa::sized(fa::CHECK, px(12.)))),
         )
         .child(label)
 }

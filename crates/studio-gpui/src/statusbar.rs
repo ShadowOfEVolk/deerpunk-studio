@@ -208,7 +208,11 @@ impl Render for StatusBar {
                     .gap_1()
                     .items_center()
                     .text_color(run_color(&run))
-                    .child(fa::sized(run_icon(&run), ICON_SIZE))
+                    .child(if matches!(run, RunState::Building | RunState::Stopping) {
+                        fa::spinner(ICON_SIZE, run_color(&run), "run-spinner", true)
+                    } else {
+                        fa::sized(run_icon(&run), ICON_SIZE)
+                    })
                     .child(
                         div()
                             .text_size(px(11.))
@@ -253,7 +257,12 @@ impl Render for StatusBar {
                         .gap_1()
                         .items_center()
                         .text_color(theme::TEXT_DIM)
-                        .child(fa::sized(fa::SPINNER, ICON_SIZE))
+                        .child(fa::spinner(
+                            ICON_SIZE,
+                            theme::TEXT_DIM,
+                            "scan-spinner",
+                            true,
+                        ))
                         .child(div().text_size(px(11.)).child("scanning…")),
                 )
             });

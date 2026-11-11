@@ -15,10 +15,12 @@
 //! cmap.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use gpui_kit::{
-    AnyElement, App, IntoElement as _, ParentElement as _, Pixels, SharedString, Styled as _, div,
-    relative,
+    Animation, AnimationExt as _, AnyElement, App, ElementId, Hsla, IntoElement as _,
+    ParentElement as _, Pixels, SharedString, Styled as _, Transformation, div, radians, relative,
+    svg,
 };
 
 /// Embedded Font Awesome 6 Free Solid webfont.
@@ -99,6 +101,51 @@ pub fn sized(code: char, size: Pixels) -> AnyElement {
         .line_height(relative(1.))
         .child(icon(code))
         .into_any_element()
+}
+
+/// Ring-spinner mark, drawn as an embedded SVG instead of the FA font
+/// glyph. GPUI's SVG pipeline renders a *single-color alpha mask* from the
+/// bytes and tints it with the element's text color, so the stroke color
+/// below is irrelevant — [`spinner`] controls the tint. The silhouette
+/// (three-quarter circle stroke) matches the FA `spinner` f110 glyph so the
+/// icon slot keeps its density when it starts rotating.
+const SPINNER_RING: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 8.5 8.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/></svg>"##;
+
+/// Public rotation is only available on the `svg()` element (`Svg::
+/// with_transformation`) — font glyphs cannot be rotated — so the animated
+/// spinner must be SVG. [`svg().data()`] embeds the bytes directly and
+/// bypasses the [`crate`](gpui) asset source entirely, keeping the helper
+/// self-contained.
+///
+/// One revolution per second, re-laid out at most 12 fps (`with_max_fps`):
+/// on a machine busy with a release build the spinner advances in coarse
+/// steps instead of demanding 120 Hz. `with_animation` also respects
+/// `App::reduce_motion`, rendering the unrotated ring.
+///
+/// `active` selects the animated ring; `false` renders the same ring
+/// statically (no animation element, no frames scheduled).
+pub fn spinner(size: Pixels, color: Hsla, id: impl Into<ElementId>, active: bool) -> AnyElement {
+    let ring = svg()
+        .data(SPINNER_RING)
+        .size(size)
+        .text_color(color)
+        .flex_shrink_0();
+    if active {
+        ring.with_animation(
+            id,
+            Animation::new(Duration::from_secs(1))
+                .repeat()
+                .with_max_fps(12.),
+            |ring, delta| {
+                ring.with_transformation(Transformation::rotate(radians(
+                    delta * std::f32::consts::TAU,
+                )))
+            },
+        )
+        .into_any_element()
+    } else {
+        ring.into_any_element()
+    }
 }
 
 /// Registers the embedded webfont with the text system. Call once at
