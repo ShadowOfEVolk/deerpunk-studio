@@ -37,6 +37,8 @@ mod diagnostics;
 mod fa;
 #[path = "../src/files.rs"]
 mod files;
+#[path = "../src/inspector.rs"]
+mod inspector;
 #[path = "../src/launch_settings.rs"]
 mod launch_settings;
 #[path = "../src/live.rs"]
@@ -476,5 +478,417 @@ fn render_diagnostics_list() {
     assert!(
         diff > 500,
         "collapsing a diagnostic changed only {diff} pixels: snippet rows do not render"
+    );
+}
+
+// ===== Entity Inspector: center-tab summon + single-line entity rows =====
+//
+// The Live sidebar's detail host moved to a shared Inspector center tab:
+// every entity-row click applies the selection to `StudioState` and pings
+// `LiveBus`; the workspace summons (first click) or re-activates (later
+// clicks) that one tab. There is no mouse synthesis without gpui-kit's
+// test-support feature (taffy pin conflict, deliberately off), so the
+// "click" is the exact body the row's on_click runs: `live::select_row`.
+// Entity payloads reuse `big_entity` — real component cards rasterize
+// (borders/fills/chevrons), text stays noop under NoopTextSystem.
+
+use deerpunk_studio::protocol::{CollectionDescriptor, CollectionGroup, CollectionMode};
+
+/// A `serverentities` collection descriptor (id_field `index`, egui parity
+/// with the entity rail button); `get_mode` adds the Get mode.
+fn entities_descriptor(get_mode: bool) -> CollectionDescriptor {
+    CollectionDescriptor {
+        id: "serverentities".into(),
+        label: "Entities".into(),
+        group: CollectionGroup::Runtime,
+        modes: if get_mode {
+            vec![CollectionMode::List, CollectionMode::Get]
+        } else {
+            vec![CollectionMode::List]
+        },
+        id_field: "index".into(),
+        nested_in: None,
+    }
+}
+
+fn count_bright(shot: &RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
+    let mut bright = 0usize;
+    for y in y0..y1.min(shot.height()) {
+        for x in x0..x1.min(shot.width()) {
+            let [r, g, b, _] = shot.get_pixel(x, y).0;
+            let luma = (2126 * r as u32 + 7152 * g as u32 + 722 * b as u32) / 10_000;
+            if luma >= 140 {
+                bright += 1;
+            }
+        }
+    }
+    bright
+}
+
+fn count_colors(shot: &RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
+    let mut colors = HashSet::new();
+    for y in y0..y1.min(shot.height()) {
+        for x in x0..x1.min(shot.width()) {
+            colors.insert(shot.get_pixel(x, y).0);
+        }
+    }
+    colors.len()
+}
+
+#[test]
+fn inspector_panel_headless_renders_detail_and_updates() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    render_inspector_panel();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    eprintln!("inspector panel: skipped; GPUI has no headless renderer on this platform");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render_inspector_panel() {
+    use gpui_kit::{
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, px, size,
+    };
+
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+
+    let state = cx.update(|cx| cx.new(|_| state::StudioState::new()));
+    let (window, _panel) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|cx| inspector::InspectorPanel::new(state.clone(), cx)),
+            )
+            .expect("open headless inspector window")
+        });
+
+    let draw = |cx: &mut gpui_kit::HeadlessAppContext,
+                window|
+     -> image::RgbaImage {
+        cx.update_window(window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .expect("render inspector frame");
+        cx.capture_screenshot(window).expect("capture inspector frame")
+    };
+
+    // No selection: the centered "Select an item" placeholder — a flat
+    // background (its text is noop under NoopTextSystem).
+    let shot_placeholder = draw(&mut cx, window);
+    assert!(
+        count_colors(&shot_placeholder, 0, 0, shot_placeholder.width(), shot_placeholder.height()) <= 4,
+        "placeholder frame should be a flat background"
+    );
+
+    // An entity is selected (as an entity-row click would set it): the
+    // panel rebuilds its memoized view and component cards rasterize.
+    let entity = big_entity(3, 20);
+    cx.update(|cx| {
+        state.update(cx, |s, cx| {
+            s.prefab_map = HashMap::from([(7u32, "player".to_string())]);
+            s.detail = Some(entity.clone());
+            cx.notify();
+        })
+    });
+    let shot_detail = draw(&mut cx, window);
+    let (w, h) = (shot_detail.width(), shot_detail.height());
+    assert!(
+        count_colors(&shot_detail, 10, 20, w - 10, h - 20) >= 8,
+        "inspector body is nearly uniform: the detail cards did not render"
+    );
+    let diff = diff_pixels(&shot_placeholder, &shot_detail);
+    assert!(
+        diff > 1000,
+        "selecting an entity changed only {diff} pixels: the panel did not rebuild its view"
+    );
+
+    // A different selection swaps the snapshot (the memo is keyed on the
+    // detail value, not built once).
+    let mut other = big_entity(2, 12);
+    other["name"] = serde_json::json!("second_entity");
+    other["index"] = serde_json::json!(9);
+    cx.update(|cx| {
+        state.update(cx, |s, cx| {
+            s.detail = Some(other.clone());
+            cx.notify();
+        })
+    });
+    let shot_second = draw(&mut cx, window);
+    let diff = diff_pixels(&shot_detail, &shot_second);
+    assert!(
+        diff > 500,
+        "switching the selection changed only {diff} pixels: the detail view is stale"
+    );
+}
+
+#[test]
+fn entity_click_summons_inspector_center_tab() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    render_entity_click_summons();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    eprintln!("inspector summon: skipped; GPUI has no headless renderer on this platform");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render_entity_click_summons() {
+    use gpui_kit::{
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, px, size,
+    };
+
+    let row1 = big_entity(3, 20);
+    let mut row2 = big_entity(2, 12);
+    row2["name"] = serde_json::json!("second_entity");
+    row2["index"] = serde_json::json!(2);
+    let raw = vec![row1.clone(), row2.clone()];
+
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+
+    let (window, workspace) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1600.), px(900.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..gpui_kit::component::TitleBar::window_options()
+                },
+                cx,
+                |window, cx| cx.new(|cx| app::Workspace::new(window, cx)),
+            )
+            .expect("open headless studio window")
+        });
+
+    let (state, bus) = cx.update(|cx| {
+        let ws = workspace.read(cx);
+        (
+            ws.studio_state_for_test().clone(),
+            ws.live_bus_for_test().clone(),
+        )
+    });
+
+    // The real list state a Live session would hold: cached rows for a
+    // list-only collection, one of them selected by a click.
+    cx.update(|cx| {
+        state.update(cx, |s, _| {
+            s.collections = vec![entities_descriptor(false)];
+            s.active_collection = Some("serverentities".into());
+            s.prefab_map = HashMap::from([(7u32, "player".to_string())]);
+            s.lists.insert(
+                "serverentities".into(),
+                serde_json::json!({"time": 0, "count": 2, "rows": [row1, row2]}),
+            );
+        })
+    });
+
+    let tab = |cx: &mut gpui_kit::HeadlessAppContext| {
+        cx.update(|cx| workspace.read(cx).inspector_tab_for_test(cx))
+    };
+    assert_eq!(
+        tab(&mut cx),
+        (false, false),
+        "the Inspector tab must not exist before any entity click"
+    );
+
+    // First click: summons the Inspector as a center tab (an add activates
+    // it) and stores the raw row as the detail snapshot.
+    cx.update_window(window, |_, window, cx| {
+        live::select_row(&state, &bus, false, "serverentities", "1", &raw, 0, cx);
+        window.refresh();
+    })
+    .expect("first entity click");
+    assert_eq!(
+        tab(&mut cx),
+        (true, true),
+        "the first entity click must summon and select the Inspector center tab"
+    );
+    assert_eq!(cx.update(|cx| state.read(cx).detail.clone()), Some(raw[0].clone()));
+
+    // Second click on another row: the same tab stays selected (one tab,
+    // not one per entity) and the snapshot follows the new selection.
+    cx.update_window(window, |_, window, cx| {
+        live::select_row(&state, &bus, false, "serverentities", "2", &raw, 1, cx);
+        window.refresh();
+    })
+    .expect("second entity click");
+    assert_eq!(tab(&mut cx), (true, true));
+    assert_eq!(cx.update(|cx| state.read(cx).detail.clone()), Some(raw[1].clone()));
+
+    // The summoned tab actually paints the detail: card fills/borders and
+    // chevron shapes rasterize in the center zone (text is noop).
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+    })
+    .expect("draw summoned inspector");
+    let shot = cx.capture_screenshot(window).expect("capture summoned frame");
+    let (w, h) = (shot.width(), shot.height());
+    // Center zone: from the center content's left edge (rail + 250px left
+    // dock ≈ 18% of the frame) across the detail cards — their borders and
+    // chevron icons hug that edge and are the pixels that rasterize (text
+    // is noop, fills are flat).
+    let colors = count_colors(&shot, w * 3 / 16, h / 8, w - 20, h * 2 / 3);
+    assert!(
+        colors >= 8,
+        "the Inspector tab body did not render the selected entity's detail ({colors} colors)"
+    );
+}
+
+#[test]
+fn live_rows_headless_render_and_click_selects() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    render_live_rows_click();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    eprintln!("live rows: skipped; GPUI has no headless renderer on this platform");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render_live_rows_click() {
+    use gpui_kit::{
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, px, size,
+    };
+
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+
+    let state = cx.update(|cx| cx.new(|_| state::StudioState::new()));
+    let bus = cx.update(|cx| cx.new(|_| live::LiveBus::new()));
+    let (window, _panel) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|cx| live::LivePanel::new(state.clone(), bus.clone(), cx)),
+            )
+            .expect("open headless live window")
+        });
+
+    // One list+get collection with three positioned rows (the sidebar is
+    // the only content — no pills, no accent anywhere before the click).
+    let rows: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            serde_json::json!({
+                "index": i + 1,
+                "name": format!("ent_{i}"),
+                "prefabId": 7,
+                "position": [i as f32 * 2.0, 0.0, -i as f32],
+                "components": [],
+            })
+        })
+        .collect();
+    let raw = rows.clone();
+    cx.update(|cx| {
+        state.update(cx, |s, _| {
+            s.collections = vec![entities_descriptor(true)];
+            s.active_collection = Some("serverentities".into());
+            s.prefab_map = HashMap::from([(7u32, "player".to_string())]);
+            s.lists.insert(
+                "serverentities".into(),
+                serde_json::json!({"time": 0, "count": 3, "rows": rows}),
+            );
+        })
+    });
+
+    let draw = |cx: &mut gpui_kit::HeadlessAppContext,
+                window|
+     -> image::RgbaImage {
+        cx.update_window(window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .expect("render live frame");
+        cx.capture_screenshot(window).expect("capture live frame")
+    };
+
+    let shot_before = draw(&mut cx, window);
+    let (w, h) = (shot_before.width(), shot_before.height());
+    // Sidebar zone: the 250px column left of the detail split (never wider
+    // than 1/4 of the frame at this window size); full height — a short
+    // list hugs the top, so a band would miss it.
+    let accent_before = count_bright(&shot_before, 0, 0, w / 4, h);
+    assert!(
+        accent_before <= 10,
+        "unexpected accent pixels before the click ({accent_before})"
+    );
+
+    // Click the second row (get-mode): the selection is recorded and the
+    // clicked row inverts to the accent fill — still one uniform line.
+    cx.update_window(window, |_, _, cx| {
+        live::select_row(&state, &bus, true, "serverentities", "2", &raw, 1, cx);
+    })
+    .expect("entity click");
+    let selection = cx.update(|cx| {
+        state
+            .read(cx)
+            .selection
+            .as_ref()
+            .map(|s| (s.col.clone(), s.index_str.clone()))
+    });
+    assert_eq!(
+        selection,
+        Some(("serverentities".into(), "2".into())),
+        "the click must record the get-mode selection"
+    );
+
+    let shot_after = draw(&mut cx, window);
+    let accent_after = count_bright(&shot_after, 0, 0, w / 4, h);
+    assert!(
+        accent_after >= accent_before + 100,
+        "the selected row did not invert to the accent fill ({accent_before} → {accent_after})"
+    );
+    let diff = diff_pixels(&shot_before, &shot_after);
+    assert!(
+        diff > 500,
+        "clicking a row changed only {diff} pixels: the list did not re-render its selection"
     );
 }

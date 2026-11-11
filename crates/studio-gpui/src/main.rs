@@ -6,6 +6,7 @@ mod cvars;
 mod diagnostics;
 mod fa;
 mod files;
+mod inspector;
 mod launch_settings;
 mod live;
 mod live_detail;

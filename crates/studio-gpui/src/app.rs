@@ -2,11 +2,17 @@
 //! layout — left dock holding the single active view (Files / Live / Cvars /
 //! Launch settings, switched by the rail), bottom dock
 //! (Console / Diagnostics), center tabs (Rmlui / Viewer, plus the Puffin
-//! profiler tab the rail summons on demand) — mirroring the egui layout in
+//! profiler tab the rail summons on demand and the entity Inspector tab a
+//! Live-sidebar click summons) — mirroring the egui layout in
 //! src/panels.rs.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use gpui_kit::component::dock::{DockArea, DockLayout, DockPlacement, DockSkin, panel_handle};
+use gpui_kit::component::dock::{
+    BasePanelView, DockArea, DockLayout, DockPlacement, DockSkin, panel_handle,
+};
+#[cfg(test)]
+use gpui_kit::component::dock::{PanelId, PaneRef};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
@@ -14,8 +20,9 @@ use crate::console::ConsolePanel;
 use crate::cvars::CvarsPanel;
 use crate::diagnostics::DiagnosticsPanel;
 use crate::files::FilesPanel;
+use crate::inspector::InspectorPanel;
 use crate::launch_settings::LaunchSettingsPanel;
-use crate::live::LivePanel;
+use crate::live::{InspectEntity, LiveBus, LivePanel};
 use crate::puffin::PuffinPanel;
 use crate::rail::{Rail, RailEvent, RailView};
 use crate::rmlui::RmluiPanel;
@@ -32,6 +39,16 @@ pub struct Workspace {
     topbar: Entity<TopBar>,
     rail: Entity<Rail>,
     statusbar: Entity<StatusBar>,
+    /// Headless-test hooks (tests/ui.rs drives entity selection without
+    /// mouse synthesis — gpui-kit's test-support feature is off): the
+    /// shared studio state, the Live inspect bus, and the Inspector tab's
+    /// panel id.
+    #[cfg(test)]
+    test_state: Entity<StudioState>,
+    #[cfg(test)]
+    test_live_bus: Entity<LiveBus>,
+    #[cfg(test)]
+    test_inspector_id: PanelId,
 }
 
 impl Workspace {
@@ -49,8 +66,9 @@ impl Workspace {
         spawn_pump(state.clone(), cx);
 
         let bus = cx.new(|_| ViewerBus::new());
+        let live_bus = cx.new(|_| LiveBus::new());
         let files = cx.new(|cx| FilesPanel::new(state.clone(), bus.clone(), cx));
-        let live = cx.new(|cx| LivePanel::new(state.clone(), cx));
+        let live = cx.new(|cx| LivePanel::new(state.clone(), live_bus.clone(), cx));
         let cvars = cx.new(|cx| CvarsPanel::new(state.clone(), cx));
         let launch = cx.new(|cx| LaunchSettingsPanel::new(state.clone(), cx));
         let console = cx.new(|cx| ConsolePanel::new(state.clone(), cx));
@@ -61,6 +79,9 @@ impl Workspace {
         // The profiler panel has no initial dock home (the rail slot summons
         // it as a center tab on demand); the workspace keeps the handle.
         let puffin = cx.new(|cx| PuffinPanel::new(state.clone(), cx));
+        // Same for the Inspector: no dock home — an entity click in the
+        // Live sidebar summons it as the (single) center tab.
+        let inspector = cx.new(|cx| InspectorPanel::new(state.clone(), cx));
 
         let files_view = panel_handle(files);
         let live_view = panel_handle(live);
@@ -71,6 +92,9 @@ impl Workspace {
         let rmlui_view = panel_handle(rmlui.clone());
         let viewers_view = panel_handle(viewers.clone());
         let puffin_view = panel_handle(puffin);
+        let inspector_view = panel_handle(inspector.clone());
+        #[cfg(test)]
+        let test_inspector_id = inspector_view.panel_id(cx);
 
         let center = DockLayout::tabs()
             .panel_view(rmlui_view.clone(), cx)
@@ -128,18 +152,7 @@ impl Workspace {
                 let _ = window_handle.update(cx, |_root, window, cx| {
                     dock_area.update(cx, |area, cx| {
                         if view == RailView::Puffin {
-                            let id = target.panel_id(cx);
-                            if area.panel(id).is_none() {
-                                area.add_panel_view(
-                                    target,
-                                    DockPlacement::Center,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            } else {
-                                area.select_panel(id, window, cx);
-                            }
+                            summon_center_tab(area, target, window, cx);
                         } else {
                             area.set_dock(
                                 DockPlacement::Left,
@@ -182,12 +195,90 @@ impl Workspace {
         })
         .detach();
 
+        // Entity-inspect routing: a click in the Live sidebar applies its
+        // selection to the shared StudioState and pings LiveBus; the
+        // workspace answers by summoning the Inspector center tab — added
+        // the first time (an add activates the tab), re-selected after, so
+        // one tab serves every entity (the rail's Puffin pattern).
+        cx.subscribe(&live_bus, {
+            let inspector_view = inspector_view;
+            let dock_area = dock_area.clone();
+            move |_, _, _: &InspectEntity, cx| {
+                let _ = window_handle.update(cx, |_root, window, cx| {
+                    dock_area.update(cx, |area, cx| {
+                        summon_center_tab(area, inspector_view.clone(), window, cx);
+                    });
+                });
+            }
+        })
+        .detach();
+
         Self {
             dock_area,
             topbar,
             rail,
             statusbar,
+            #[cfg(test)]
+            test_state: state,
+            #[cfg(test)]
+            test_live_bus: live_bus,
+            #[cfg(test)]
+            test_inspector_id,
         }
+    }
+}
+
+/// Summon `view` as a center tab: add it the first time (an add activates
+/// the tab), select the existing tab afterwards. Shared by the rail's
+/// Puffin slot and the entity-inspect routing — one panel, one tab, no
+/// per-target duplicates.
+fn summon_center_tab(
+    area: &mut DockArea,
+    view: Arc<dyn BasePanelView>,
+    window: &mut Window,
+    cx: &mut Context<DockArea>,
+) {
+    let id = view.panel_id(cx);
+    if area.panel(id).is_none() {
+        area.add_panel_view(view, DockPlacement::Center, None, window, cx);
+    } else {
+        area.select_panel(id, window, cx);
+    }
+}
+
+#[cfg(test)]
+impl Workspace {
+    /// The shared studio state (headless tests drive entity selection
+    /// through `live::select_row`; mouse synthesis is unavailable without
+    /// gpui-kit's test-support feature).
+    pub fn studio_state_for_test(&self) -> &Entity<StudioState> {
+        &self.test_state
+    }
+
+    /// The Live inspect bus: emitting [`InspectEntity`] on it exercises the
+    /// workspace's Inspector summon routing end-to-end.
+    pub fn live_bus_for_test(&self) -> &Entity<LiveBus> {
+        &self.test_live_bus
+    }
+
+    /// Inspector tab state: present in the dock area, and selected as the
+    /// active tab of its center tab group.
+    pub fn inspector_tab_for_test(&self, cx: &App) -> (bool, bool) {
+        let area = self.dock_area.read(cx);
+        let present = area.panel(self.test_inspector_id).is_some();
+        let selected = area
+            .layout(DockPlacement::Center)
+            .and_then(|tree| {
+                let node = tree.find_panel_node(self.test_inspector_id)?;
+                match tree.find_node(node)?.kind() {
+                    PaneRef::Tabs { panels, active_ix } => {
+                        Some(panels.get(active_ix) == Some(&self.test_inspector_id))
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or(false);
+        (present, selected)
     }
 }
 

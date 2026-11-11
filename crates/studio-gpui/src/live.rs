@@ -1,12 +1,14 @@
-//! Live inspector panel (left sidebar + detail host): collection picker,
-//! the active collection's entity list, and the selected entity's detail
-//! view. Ported from the egui Live tab — src/panels.rs
-//! `collection_sidebar`/`entity_row`/`prefab_glyph`/`name_or_first` and the
-//! `detail_panel` scaffolding; src/app.rs `select` + the
-//! `ensure_active_list` lazy fetch (activating a collection fetches
+//! Live inspector panel (left sidebar): collection picker, the active
+//! collection's entity list, and the filter box. Ported from the egui Live
+//! tab — src/panels.rs `collection_sidebar`/`entity_row`/`prefab_glyph`/
+//! `name_or_first` and the `detail_panel` scaffolding; src/app.rs `select`
+//! + the `ensure_active_list` lazy fetch (activating a collection fetches
 //! immediately when the cached list is stale instead of waiting for the
-//! refresh timer). The detail view itself is `crate::live_detail::detail`;
-//! this panel only hosts it.
+//! refresh timer). Row clicks apply the selection to the shared
+//! `StudioState` (`select` / `detail`) and ping [`LiveBus`]; the workspace
+//! answers by summoning the Inspector center tab
+//! ([`crate::inspector::InspectorPanel`], hosted view:
+//! `crate::live_detail::detail`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +16,6 @@ use std::time::Duration;
 
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::separator::Separator;
 use gpui_kit::component::theme::ActiveTheme as _;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -31,10 +32,9 @@ use crate::theme;
 
 /// Sidebar column width (egui `Panel::left("sidebar").default_size(250.0)`).
 const SIDEBAR_W: f32 = 250.;
-/// Entity row heights: two lines (name + position) vs a single name line
-/// (egui entity_row: 30 / 20). `uniform_list` lays every row out with one
-/// measured height, so the tall variant applies to the whole list.
-const ROW_TALL: f32 = 30.;
+/// Entity row height: a single line — name plus right-aligned position
+/// (egui entity_row's plain 20). `uniform_list` lays every row out with
+/// this one measured height.
 const ROW_PLAIN: f32 = 20.;
 /// Row text density, matching the files panel rows (egui used 13 px names).
 const NAME_SIZE: f32 = 12.5;
@@ -202,9 +202,65 @@ fn activate(state: &Entity<StudioState>, id: &str, cx: &mut App) {
     });
 }
 
+// ----------------------------------------------------------------- inspect bus
+
+/// Event emitted by [`LiveBus`]: an entity row was clicked. The workspace
+/// answers by summoning/activating the shared Inspector center tab; the
+/// selection snapshot itself rides in `StudioState::detail`, so the event
+/// carries no payload.
+pub struct InspectEntity;
+
+/// Click bus between the Live panel's entity list and the workspace's
+/// Inspector tab (the `ViewerBus`/`OpenFile` pattern).
+pub struct LiveBus;
+
+impl LiveBus {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Report that the user inspected an entity row.
+    pub fn inspect(&mut self, cx: &mut Context<Self>) {
+        cx.emit(InspectEntity);
+    }
+}
+
+impl EventEmitter<InspectEntity> for LiveBus {}
+
+/// Body of the entity-row click (shared with the headless tests, which
+/// cannot synthesize mouse events): apply the selection to `state` —
+/// get-mode collections request the detail snapshot, list-only collections
+/// show the raw row (egui's click branch) — and ping `bus` so the
+/// workspace summons the Inspector center tab.
+pub(crate) fn select_row(
+    state: &Entity<StudioState>,
+    bus: &Entity<LiveBus>,
+    get_mode: bool,
+    col: &str,
+    index_str: &str,
+    raw: &[Value],
+    raw_ix: usize,
+    cx: &mut App,
+) {
+    state.update(cx, |s, cx| {
+        if get_mode {
+            s.select(col.to_string(), index_str.to_string());
+        } else if let Some(row) = raw.get(raw_ix) {
+            s.detail = Some(row.clone());
+        }
+        // Immediate redraw of the selection (the 50ms pump would catch up,
+        // but the click should show without a beat).
+        cx.notify();
+    });
+    bus.update(cx, |b, cx| b.inspect(cx));
+}
+
 pub struct LivePanel {
     focus_handle: FocusHandle,
     state: Entity<StudioState>,
+    /// Click bus to the workspace's Inspector tab; every entity-row click
+    /// pings it so the tab is (re)activated.
+    bus: Entity<LiveBus>,
     /// Single-line filter input; created lazily in `render` (needs `Window`).
     filter_input: Option<Entity<InputState>>,
     /// Per-collection filter text (egui `app.filters[id]`; the gpui
@@ -216,11 +272,12 @@ pub struct LivePanel {
 }
 
 impl LivePanel {
-    pub fn new(state: Entity<StudioState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<StudioState>, bus: Entity<LiveBus>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         Self {
             focus_handle: cx.focus_handle(),
             state,
+            bus,
             filter_input: None,
             filters: HashMap::new(),
             filter_col: None,
@@ -317,7 +374,8 @@ impl LivePanel {
                     sidebar = sidebar.child(pills(&collections, active.as_deref(), &self.state));
                 }
                 sidebar = sidebar.child(self.filter_row(window, cx));
-                sidebar = sidebar.child(rows(id, d, mono, self.state.clone()));
+                sidebar =
+                    sidebar.child(rows(id, d, mono, self.state.clone(), self.bus.clone()));
             }
             // Active but not fetched yet: egui's early-return header branch
             // (id as the title, connection status as the badge).
@@ -384,41 +442,9 @@ impl Panel for LivePanel {
 
 impl Render for LivePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = self.render_sidebar(window, cx);
-        // Detail host: brother-agent's `live_detail::detail` view, or the
-        // egui placeholder while nothing is selected.
-        let detail = {
-            let st = self.state.read(cx);
-            st.detail.clone().map(|d| (d, st.prefab_map.clone()))
-        };
-        let detail_area: AnyElement = match detail {
-            Some((d, prefab_map)) => div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .overflow_hidden()
-                .child(crate::live_detail::detail(&d, &prefab_map, window, cx))
-                .into_any_element(),
-            None => div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme::FAINT)
-                .text_size(px(NAME_SIZE))
-                .child("Select an item")
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .size_full()
-            .bg(theme::BG)
-            .child(sidebar)
-            .child(Separator::vertical())
-            .child(detail_area)
+        // Sidebar only: the detail view lives in the Inspector center tab
+        // (summoned by the workspace on entity clicks), not beside the list.
+        self.render_sidebar(window, cx)
     }
 }
 
@@ -554,14 +580,15 @@ fn picker(
 }
 
 /// The active collection's visible rows as a virtual list (egui
-/// ScrollArea over entity_row/sidebar_row rows). Row height is uniform per
-/// list: tall when any row carries a position, plain otherwise.
-fn rows(id: &str, d: SidebarData, mono: SharedString, state: Entity<StudioState>) -> AnyElement {
-    let row_h = if d.models.iter().any(|m| m.position.is_some()) {
-        ROW_TALL
-    } else {
-        ROW_PLAIN
-    };
+/// ScrollArea over entity_row/sidebar_row rows). Every row is the same
+/// single-line slot.
+fn rows(
+    id: &str,
+    d: SidebarData,
+    mono: SharedString,
+    state: Entity<StudioState>,
+    bus: Entity<LiveBus>,
+) -> AnyElement {
     let get_mode = d.get_mode;
     let models = Arc::new(d.models);
     let raw = Arc::new(d.raw);
@@ -582,17 +609,17 @@ fn rows(id: &str, d: SidebarData, mono: SharedString, state: Entity<StudioState>
                         ix,
                         m,
                         selected,
-                        row_h,
                         get_mode,
                         &col,
                         &raw,
                         &state,
+                        &bus,
                         mono.clone(),
                     )
                     .into_any_element()
                 }
                 // Keeps the measured slot when the list is empty.
-                None => div().h(px(row_h)).into_any_element(),
+                None => div().h(px(ROW_PLAIN)).into_any_element(),
             })
             .collect::<Vec<_>>()
     })
@@ -602,35 +629,27 @@ fn rows(id: &str, d: SidebarData, mono: SharedString, state: Entity<StudioState>
     .into_any_element()
 }
 
-/// Entity list row: 16px prefab icon slot, the display name, and for
-/// positioned entities a muted "x y z" line under it (egui `entity_row`).
-/// Selected rows invert to the accent background; missing icon/prefab
-/// degrades to a plain name line (egui `sidebar_row`).
+/// Entity list row: one line — a 16px prefab icon slot, the display name
+/// (flex, ellipsis), and a right-aligned muted monospace "x y z" when the
+/// entity has a position (egui `entity_row`). Selected rows invert to the
+/// accent background; missing icon/prefab degrades to a plain name row
+/// (egui `sidebar_row`).
 #[allow(clippy::too_many_arguments)]
 fn entity_row(
     ix: usize,
     m: &RowModel,
     selected: bool,
-    row_h: f32,
     get_mode: bool,
     col: &str,
     raw: &Arc<Vec<Value>>,
     state: &Entity<StudioState>,
+    bus: &Entity<LiveBus>,
     mono: SharedString,
 ) -> AnyElement {
-    let (name_color, dim_color, icon_color) = if selected {
+    let (name_color, pos_color, icon_color) = if selected {
         (theme::ACCENT_TEXT, theme::ACCENT_TEXT, theme::ACCENT_TEXT)
     } else {
         (theme::TEXT, theme::FAINT, theme::MUTED)
-    };
-    let name = |text: String| {
-        div()
-            .min_w_0()
-            .overflow_hidden()
-            .text_ellipsis()
-            .text_size(px(NAME_SIZE))
-            .text_color(name_color)
-            .child(text)
     };
 
     let mut row = div()
@@ -640,7 +659,7 @@ fn entity_row(
         .items_center()
         .gap_1p5()
         .px_2()
-        .h(px(row_h))
+        .h(px(ROW_PLAIN))
         .rounded(px(2.))
         .when(selected, |d| d.bg(theme::ACCENT))
         .when(!selected, |d| d.hover(|s| s.bg(theme::HOVER)));
@@ -656,48 +675,40 @@ fn entity_row(
         );
     }
 
-    match m.position {
-        Some(p) => {
-            row = row.child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .justify_center()
-                    .child(name(m.display_name.clone()))
-                    .child(
-                        div()
-                            .font_family(mono)
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(POS_SIZE))
-                            .text_color(dim_color)
-                            .child(protocol::format_position(&p)),
-                    ),
-            );
-        }
-        None => {
-            row = row.child(name(m.display_name.clone()).flex_1());
-        }
+    // The name flexes as the spacer: the position always hugs the row's
+    // right edge. Both halves ellipsize when the sidebar runs out of width.
+    row = row.child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .text_size(px(NAME_SIZE))
+            .text_color(name_color)
+            .child(m.display_name.clone()),
+    );
+
+    if let Some(p) = m.position {
+        row = row.child(
+            div()
+                .font_family(mono)
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(POS_SIZE))
+                .text_color(pos_color)
+                .child(protocol::format_position(&p)),
+        );
     }
 
     row = row.on_click({
         let state = state.clone();
+        let bus = bus.clone();
         let col = col.to_string();
         let index_str = m.index_str.clone();
         let raw = raw.clone();
         let raw_ix = m.raw_ix;
-        move |_, _, cx| {
-            state.update(cx, |s, _| {
-                // List+get collections fetch the detail snapshot; list-only
-                // collections show the raw row (egui's click branch).
-                if get_mode {
-                    s.select(col.clone(), index_str.clone());
-                } else if let Some(row) = raw.get(raw_ix) {
-                    s.detail = Some(row.clone());
-                }
-            });
-        }
+        move |_, _, cx| select_row(&state, &bus, get_mode, &col, &index_str, &raw, raw_ix, cx)
     });
     row.into_any_element()
 }
@@ -802,10 +813,6 @@ mod tests {
         assert_eq!(all.models[1].display_name, "misc ent");
         assert_eq!(all.models[1].classname, None);
         assert_eq!(all.models[1].position, None);
-
-        // Position rows put the list in the tall uniform slot.
-        let tall = &all.models;
-        assert!(tall.iter().any(|m| m.position.is_some()));
 
         // Filter hits the classname display name but not the bare name.
         let by_class = snapshot(&state, "serverentities", "PLAY").expect("filter result");
