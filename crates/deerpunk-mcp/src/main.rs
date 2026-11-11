@@ -18,35 +18,96 @@ use inspector::Inspector;
 
 const DEFAULT_PORT: u16 = 9100;
 const DEFAULT_INSPECTOR: &str = "127.0.0.1:9000";
+/// How often the anti-orphan watcher checks that the parent is still alive.
+const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 static START: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
 
-fn main() {
-    let mut port = DEFAULT_PORT;
-    let mut inspector_addr = DEFAULT_INSPECTOR.to_string();
-    let mut stdio = false;
-    let mut args = std::env::args().skip(1);
+#[derive(Debug)]
+struct Args {
+    port: u16,
+    inspector_addr: String,
+    stdio: bool,
+    /// Studio pid passed via `--parent-pid`; the process exits once it is gone.
+    parent_pid: Option<u32>,
+}
+
+fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
+    let mut parsed = Args {
+        port: DEFAULT_PORT,
+        inspector_addr: DEFAULT_INSPECTOR.to_string(),
+        stdio: false,
+        parent_pid: None,
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => {
-                port = args
+                parsed.port = args
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(DEFAULT_PORT);
             }
             "--inspector" => {
                 if let Some(v) = args.next() {
-                    inspector_addr = v;
+                    parsed.inspector_addr = v;
                 }
             }
-            "--stdio" => stdio = true,
+            "--stdio" => parsed.stdio = true,
+            "--parent-pid" => {
+                parsed.parent_pid = args.next().and_then(|v| v.parse().ok());
+            }
             other => {
-                eprintln!("unknown argument: {other}");
-                eprintln!("usage: deerpunk-mcp [--port N] [--inspector host:port] [--stdio]");
-                std::process::exit(2);
+                return Err(format!(
+                    "unknown argument: {other}\nusage: deerpunk-mcp [--port N] [--inspector host:port] [--stdio] [--parent-pid pid]"
+                ));
             }
         }
     }
+    Ok(parsed)
+}
+
+/// True while `pid` is an existing process. `kill(pid, 0)` performs the
+/// existence check without signalling; EPERM still means "exists" (someone
+/// else's process).
+#[allow(unsafe_code)] // libc::kill is a trivially safe-in-practice syscall probe
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill(2) with signal 0 only performs permission/existence checks.
+    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+        0 => true,
+        _ => std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+    }
+}
+
+fn main() {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    let Args {
+        port,
+        inspector_addr,
+        stdio,
+        parent_pid,
+    } = args;
+
+    // Anti-orphan watch: the studio passes its own pid; when it goes away
+    // (crash, kill -9 — anything a Drop in the parent cannot cover) we exit
+    // instead of squatting on the port forever.
+    if let Some(pid) = parent_pid {
+        std::thread::Builder::new()
+            .name("parent-watch".into())
+            .spawn(move || loop {
+                if !pid_alive(pid) {
+                    std::process::exit(0);
+                }
+                std::thread::sleep(PARENT_POLL_INTERVAL);
+            })
+            .expect("spawn parent-watch thread");
+    }
+
     let (host, port_i) = match inspector_addr.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(9000)),
         None => (inspector_addr.clone(), 9000),
@@ -167,4 +228,49 @@ fn status_json(mcp: &Inspector, port: u16) -> Value {
             "description": t.description,
         })).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(items: &[&str]) -> Result<Args, String> {
+        parse_args(items.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_when_no_args() {
+        let a = parse(&[]).unwrap();
+        assert_eq!(a.port, DEFAULT_PORT);
+        assert_eq!(a.inspector_addr, DEFAULT_INSPECTOR);
+        assert!(!a.stdio);
+        assert_eq!(a.parent_pid, None);
+    }
+
+    #[test]
+    fn parses_all_flags() {
+        let a = parse(&["--port", "1234", "--inspector", "10.0.0.5:7000", "--stdio", "--parent-pid", "4242"]).unwrap();
+        assert_eq!(a.port, 1234);
+        assert_eq!(a.inspector_addr, "10.0.0.5:7000");
+        assert!(a.stdio);
+        assert_eq!(a.parent_pid, Some(4242));
+    }
+
+    #[test]
+    fn unknown_argument_is_usage_error() {
+        let err = parse(&["--bogus"]).unwrap_err();
+        assert!(err.contains("usage"));
+    }
+
+    #[test]
+    fn self_pid_is_alive() {
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn dead_pid_is_not_alive() {
+        // No sane pid table hands out 999999999 (> 32-bit pid_t range on
+        // darwin/linux), so this pid cannot exist.
+        assert!(!pid_alive(999_999_999));
+    }
 }

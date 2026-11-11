@@ -175,6 +175,10 @@ impl McpManager {
             &self.port.to_string(),
             "--inspector",
             inspector_addr,
+            // The child watches this pid and exits if the studio dies without
+            // running Drop (crash / kill -9) — no orphaned port squatting.
+            "--parent-pid",
+            &std::process::id().to_string(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())

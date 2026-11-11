@@ -13,6 +13,7 @@
 //! nanosecond ranges to pixels at paint time.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use deerpunk_studio::runner::RunState;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -63,6 +64,93 @@ struct Snapshot {
     collection: ScopeCollection,
 }
 
+/// First soft-retry delay after a failed attempt while a project is open.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Cap for the exponential soft-retry backoff (attempts double: 1s, 2s, …).
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pure trigger policy for puffin auto-connect, extracted so the logic is
+/// unit-testable without gpui. Decides when the panel should create a
+/// `puffin_http` client towards [`DEFAULT_ADDR`] (or the user-typed address):
+///
+/// - entering [`RunState::Running`] attempts immediately (once per run; the
+///   client itself retries on its thread until the engine's server accepts);
+/// - a project being open also triggers an attempt (engine started outside
+///   the studio), then soft-retries while the project stays open: exponentially
+///   backing off from [`RETRY_BASE`] to [`RETRY_MAX`] so we never spam;
+/// - a manual Disconnect suppresses all auto attempts until the next
+///   Running entry or a project (re)open re-arms them.
+struct AutoConnectPolicy {
+    last_run_state: Option<RunState>,
+    last_project_open: bool,
+    manual_disconnect: bool,
+    last_attempt: Option<std::time::Instant>,
+    attempts: u32,
+}
+
+impl AutoConnectPolicy {
+    fn new() -> Self {
+        Self {
+            last_run_state: None,
+            last_project_open: false,
+            manual_disconnect: false,
+            last_attempt: None,
+            attempts: 0,
+        }
+    }
+
+    /// Backoff for the next soft retry (`attempts` consecutive attempts so far).
+    fn retry_delay(attempts: u32) -> std::time::Duration {
+        RETRY_BASE
+            .checked_mul(1u32.checked_shl(attempts.min(5)).unwrap_or(32))
+            .unwrap_or(RETRY_MAX)
+            .min(RETRY_MAX)
+    }
+
+    /// Evaluate one `StudioState` observation. Returns `true` when a connect
+    /// attempt should be made now (`has_client` = a client already exists).
+    fn evaluate(
+        &mut self,
+        run_state: &RunState,
+        project_open: bool,
+        has_client: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let run_entry = *run_state == RunState::Running
+            && self.last_run_state.as_ref() != Some(run_state);
+        let project_entry = project_open && !self.last_project_open;
+
+        // Fresh run or freshly opened project re-arms suppressed attempts.
+        if run_entry || project_entry {
+            self.manual_disconnect = false;
+            self.attempts = 0;
+        }
+        if run_entry {
+            self.last_attempt = None;
+        }
+        self.last_run_state = Some(run_state.clone());
+        self.last_project_open = project_open;
+
+        // While Running: one immediate attempt per run (client self-retries).
+        // Otherwise: retry while a project is open, rate-limited by backoff.
+        let want = if *run_state == RunState::Running {
+            self.last_attempt.is_none()
+        } else {
+            project_open
+        };
+        let cooldown_ok = match self.last_attempt {
+            None => true,
+            Some(t) => now.duration_since(t) >= Self::retry_delay(self.attempts),
+        };
+        if !want || !cooldown_ok || has_client || self.manual_disconnect {
+            return false;
+        }
+        self.last_attempt = Some(now);
+        self.attempts = self.attempts.saturating_add(1);
+        true
+    }
+}
+
 pub struct PuffinPanel {
     focus_handle: FocusHandle,
     /// Observed for the 50 ms pump notifications (live frame updates).
@@ -75,12 +163,8 @@ pub struct PuffinPanel {
 
     /// `puffin_http` client; dropping it stops its receiver thread.
     client: Option<puffin_http::Client>,
-    /// Run-state tracking for auto-connect: one attempt per engine run; a
-    /// manual Disconnect suppresses further attempts until the next run
-    /// starts (a manual Connect re-arms them).
-    last_run_state: Option<RunState>,
-    auto_connect_done: bool,
-    manual_disconnect: bool,
+    /// Auto-connect trigger policy (pure, unit-testable).
+    policy: AutoConnectPolicy,
     view: View,
     /// Frozen selection (vendor `Paused`); `None` = live latest frames.
     paused: Option<Arc<Snapshot>>,
@@ -119,9 +203,7 @@ impl PuffinPanel {
             filter_input: None,
             table: None,
             client: None,
-            last_run_state: None,
-            auto_connect_done: false,
-            manual_disconnect: false,
+            policy: AutoConnectPolicy::new(),
             view: View::Flamegraph,
             paused: None,
             snapshot: None,
@@ -201,25 +283,18 @@ impl PuffinPanel {
 
     // -- data --------------------------------------------------------------
 
-    /// Auto-connect hook on `StudioState` changes: when the engine enters
-    /// [`RunState::Running`] and no client exists, create one `puffin_http`
-    /// client — it retries on its own thread until the game's server accepts
-    /// (so one attempt per run is enough). A manual Disconnect is respected
-    /// for the rest of the run; a fresh run re-arms the attempt and a manual
-    /// Connect re-enables automation.
+    /// Auto-connect hook on `StudioState` changes: attempt a `puffin_http`
+    /// connection when the engine enters [`RunState::Running`] (one attempt
+    /// per run — the client retries on its own thread) or while a project is
+    /// open without a client (engine started outside the studio), with an
+    /// exponential soft-retry backoff. A manual Disconnect is respected until
+    /// the next run entry or project (re)open; a manual Connect re-enables
+    /// automation. See [`AutoConnectPolicy`] for the exact trigger rules.
     fn observe_state(&mut self, state: &Entity<StudioState>, cx: &mut Context<Self>) {
-        let run_state = state.read(cx).run_state.clone();
-        let prev = self.last_run_state.replace(run_state.clone());
-        if run_state == RunState::Running && prev.as_ref() != Some(&run_state) {
-            self.auto_connect_done = false;
-            self.manual_disconnect = false;
-        }
-        if run_state == RunState::Running
-            && !self.auto_connect_done
-            && self.client.is_none()
-            && !self.manual_disconnect
-        {
-            self.auto_connect_done = true;
+        let s = state.read(cx);
+        let run_state = s.run_state.clone();
+        let project_open = s.project.is_some();
+        if self.policy.evaluate(&run_state, project_open, self.client.is_some(), Instant::now()) {
             let addr = self.addr(cx);
             self.connect(addr, cx);
             return; // connect() already notified
@@ -350,7 +425,7 @@ impl PuffinPanel {
 
     fn connect(&mut self, addr: String, cx: &mut Context<Self>) {
         self.client = Some(puffin_http::Client::new(addr));
-        self.manual_disconnect = false;
+        self.policy.manual_disconnect = false;
         self.paused = None;
         self.snapshot = None;
         self.layout = None;
@@ -361,8 +436,9 @@ impl PuffinPanel {
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.client = None;
-        // A manual disconnect wins over auto-connect until the next run.
-        self.manual_disconnect = true;
+        // A manual disconnect wins over auto-connect until the next run or
+        // a project (re)open.
+        self.policy.manual_disconnect = true;
         self.paused = None;
         self.snapshot = None;
         self.layout = None;
@@ -1815,5 +1891,94 @@ impl TableDelegate for StatsDelegate {
             _ => return Some(format!("{:>8.1} µs", row.stats.max_ns as f32 * 1e-3).into()),
         };
         (!text.is_empty()).then(|| text.clone().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AutoConnectPolicy, RETRY_MAX};
+    use deerpunk_studio::runner::RunState;
+    use std::time::{Duration, Instant};
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn running_entry_attempts_once() {
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        // Engine not running yet: no attempt.
+        assert!(!p.evaluate(&RunState::Idle, false, false, t));
+        // Engine run starts → immediate attempt.
+        assert!(p.evaluate(&RunState::Running, false, false, t));
+        // Same state again: no second attempt (client self-retries).
+        assert!(!p.evaluate(&RunState::Running, false, false, t + Duration::from_millis(50)));
+        // Next run re-arms.
+        assert!(!p.evaluate(&RunState::Idle, false, false, t + Duration::from_secs(1)));
+        assert!(p.evaluate(&RunState::Running, false, false, t + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn project_open_triggers_then_backs_off() {
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        // Project opened (engine started outside the studio) → attempt.
+        assert!(p.evaluate(&RunState::Idle, true, false, t));
+        // Backoff: first retry waits retry_delay(1)=2s, then retry_delay(2)=4s.
+        assert!(!p.evaluate(&RunState::Idle, true, false, t + Duration::from_millis(1999)));
+        assert!(p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(2)));
+        assert!(!p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(3)));
+        assert!(!p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(5)));
+        assert!(p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(6)));
+        // Delays double, capped at 30s.
+        assert_eq!(AutoConnectPolicy::retry_delay(0), Duration::from_secs(1));
+        assert_eq!(AutoConnectPolicy::retry_delay(4), Duration::from_secs(16));
+        assert_eq!(AutoConnectPolicy::retry_delay(9), RETRY_MAX);
+    }
+
+    #[test]
+    fn no_project_no_attempt() {
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        assert!(!p.evaluate(&RunState::Idle, false, false, t));
+        assert!(!p.evaluate(&RunState::Building, false, false, t + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn existing_client_suppresses_attempts() {
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        assert!(!p.evaluate(&RunState::Running, true, true, t));
+        assert!(!p.evaluate(&RunState::Idle, true, true, t + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn manual_disconnect_suppressed_until_ream() {
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        assert!(p.evaluate(&RunState::Idle, true, false, t));
+        p.manual_disconnect = true; // as `disconnect()` sets it
+        // Suppressed while the project stays open.
+        assert!(!p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(60)));
+        // Re-armed by the next Running entry.
+        assert!(p.evaluate(&RunState::Running, true, false, t + Duration::from_secs(61)));
+        // …and by a project re-open.
+        p.manual_disconnect = true;
+        assert!(!p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(90)));
+        assert!(!p.evaluate(&RunState::Idle, false, false, t + Duration::from_secs(91)));
+        assert!(p.evaluate(&RunState::Idle, true, false, t + Duration::from_secs(92)));
+    }
+
+    #[test]
+    fn connect_clears_manual_disconnect_semantics() {
+        // Mirrors connect()/disconnect(): policy re-armed on evaluate paths.
+        let mut p = AutoConnectPolicy::new();
+        let t = t0();
+        assert!(p.evaluate(&RunState::Idle, true, false, t));
+        assert_eq!(p.attempts, 1);
+        // Run entry resets the backoff counter.
+        assert!(p.evaluate(&RunState::Running, true, false, t + Duration::from_secs(60)));
+        assert_eq!(p.attempts, 1);
     }
 }

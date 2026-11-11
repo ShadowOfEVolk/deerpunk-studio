@@ -1,7 +1,9 @@
 //! Files panel (left dock): the scanned gamedir as a tree. The flat
 //! [`ScanResult`] entry list is folded into a path tree of gpui-kit
 //! `TreeItem`s; clicking a file asks the [`ViewerBus`] to open it in the
-//! Viewer panel. The tree rebuilds when `state.scan` changes.
+//! Viewer panel (gpui-kit's tree expands/collapses folder rows on click by
+//! itself). The tree rebuilds when `state.scan` changes; the folders the
+//! user explicitly expanded/collapsed are remembered across rebuilds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::component::list::ListItem;
-use gpui_kit::component::tree::{TreeItem, TreeState, tree};
+use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{Icon, IconName, h_flex};
 use gpui_kit::*;
 
@@ -27,6 +29,11 @@ pub struct FilesPanel {
     /// Tree-item id (rel path, lossy string) → path relative to the gamedir,
     /// used by click handlers to resolve the absolute file path.
     paths: Arc<HashMap<SharedString, PathBuf>>,
+    /// Tree-item id → the user's explicit expansion toggle. Applied on every
+    /// rebuild so folders stay opened/closed across rescans; ids whose paths
+    /// no longer exist are dropped. Unlisted ids use the default (top level
+    /// expanded, deeper levels collapsed).
+    user_expanded: HashMap<SharedString, bool>,
     last_entries: Option<Vec<AssetEntry>>,
 }
 
@@ -35,12 +42,24 @@ impl FilesPanel {
         let tree = cx.new(|cx| TreeState::new(cx));
         cx.observe(&state, |this, _, cx| this.sync_scan(cx))
             .detach();
+        // The kit tree toggles folders on click and reports it; record the
+        // user's intent so the next rebuild (new scan) re-applies it.
+        cx.subscribe(&tree, |this, _, event, _| match event {
+            TreeEvent::Expanded(id) => {
+                this.user_expanded.insert(id.clone(), true);
+            }
+            TreeEvent::Collapsed(id) => {
+                this.user_expanded.insert(id.clone(), false);
+            }
+        })
+        .detach();
         Self {
             focus_handle: cx.focus_handle(),
             state,
             bus,
             tree,
             paths: Arc::default(),
+            user_expanded: HashMap::new(),
             last_entries: None,
         }
     }
@@ -57,9 +76,11 @@ impl FilesPanel {
             return;
         }
         let entries = self.state.read(cx).scan.as_ref().map(|s| s.entries.clone());
-        let (items, paths) = build_tree(entries.as_deref());
+        let (items, paths) = build_tree(entries.as_deref(), &self.user_expanded);
         self.last_entries = entries;
         self.paths = Arc::new(paths);
+        // Paths that vanished with the new scan drop their stale toggle.
+        self.user_expanded.retain(|id, _| self.paths.contains_key(id));
         self.tree.update(cx, |tree, cx| tree.set_items(items, cx));
         cx.notify();
     }
@@ -67,8 +88,12 @@ impl FilesPanel {
 
 /// Fold the flat scan list into a path tree of `TreeItem`s. Returns the
 /// items plus the id → rel-path map used by click handlers. Top-level
-/// folders start expanded, deeper ones collapsed.
-fn build_tree(entries: Option<&[AssetEntry]>) -> (Vec<TreeItem>, HashMap<SharedString, PathBuf>) {
+/// folders start expanded, deeper ones collapsed; `user_expanded` overrides
+/// the default per folder (see [`FilesPanel::new`]'s subscription).
+fn build_tree(
+    entries: Option<&[AssetEntry]>,
+    user_expanded: &HashMap<SharedString, bool>,
+) -> (Vec<TreeItem>, HashMap<SharedString, PathBuf>) {
     let Some(entries) = entries else {
         return (Vec::new(), HashMap::new());
     };
@@ -77,7 +102,7 @@ fn build_tree(entries: Option<&[AssetEntry]>) -> (Vec<TreeItem>, HashMap<SharedS
         root.insert(&entry.rel);
     }
     let mut paths = HashMap::new();
-    let items = root.to_items(Path::new(""), 0, &mut paths);
+    let items = root.to_items(Path::new(""), 0, user_expanded, &mut paths);
     (items, paths)
 }
 
@@ -108,18 +133,16 @@ impl DirNode {
         &self,
         prefix: &Path,
         depth: usize,
+        user_expanded: &HashMap<SharedString, bool>,
         paths: &mut HashMap<SharedString, PathBuf>,
     ) -> Vec<TreeItem> {
         let mut items = Vec::new();
         for (name, node) in &self.dirs {
             let rel = prefix.join(name);
             let id = id_of(&rel, paths);
-            let children = node.to_items(&rel, depth + 1, paths);
-            items.push(
-                TreeItem::new(id, name.clone())
-                    .expanded(depth == 0)
-                    .children(children),
-            );
+            let children = node.to_items(&rel, depth + 1, user_expanded, paths);
+            let expanded = user_expanded.get(&id).copied().unwrap_or(depth == 0);
+            items.push(TreeItem::new(id, name.clone()).expanded(expanded).children(children));
         }
         for name in &self.files {
             let rel = prefix.join(name);
@@ -198,10 +221,15 @@ impl Render for FilesPanel {
                 // Compact editor rows: 12.5px label, tight padding, small
                 // indent steps. Refinements override ListItem's built-in
                 // `py_1().px_3().text_base()` (applied via `refine_style`).
+                let selector_id = id.clone();
+                // Headless tests look rows up by rel path; the selector is a
+                // no-op without gpui's test-support. `id` itself is still
+                // needed below for the file-click handler.
                 let mut row = ListItem::new(("files-row", ix))
                     .text_size(px(12.5))
                     .py_0p5()
                     .px_2()
+                    .debug_selector(move || format!("files-row-{}", selector_id))
                     .child(
                         h_flex()
                             .gap_1p5()
@@ -239,6 +267,7 @@ mod tests {
     use deerpunk_studio::assets::{AssetEntry, AssetKind};
     use gpui_kit::SharedString;
 
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     fn entry(rel: &str) -> AssetEntry {
@@ -260,7 +289,7 @@ mod tests {
             entry("textures/blocks/stone.png"),
             entry("textures/ui.png"),
         ];
-        let (items, paths) = build_tree(Some(&entries));
+        let (items, paths) = build_tree(Some(&entries), &HashMap::new());
 
         let [textures, a] = items.as_slice() else {
             panic!("expected [textures, a.txt], got {} items", items.len());
@@ -293,8 +322,44 @@ mod tests {
     /// No scan yields no items.
     #[test]
     fn missing_scan_yields_empty_tree() {
-        let (items, paths) = build_tree(None);
+        let (items, paths) = build_tree(None, &HashMap::new());
         assert!(items.is_empty());
         assert!(paths.is_empty());
+    }
+
+    /// An explicit user toggle overrides the default for its folder: a
+    /// deeper folder marked expanded opens, a top-level folder marked
+    /// collapsed stays shut. The override is keyed by rel path and leaves
+    /// other folders at their defaults.
+    #[test]
+    fn user_toggles_override_default_expansion() {
+        let entries = [
+            entry("a.txt"),
+            entry("textures/blocks/stone.png"),
+            entry("textures/ui.png"),
+        ];
+        let expanded = [(
+            SharedString::from("textures/blocks"),
+            true,
+        )]
+        .into_iter()
+        .collect();
+        let (items, _) = build_tree(Some(&entries), &expanded);
+        let [textures, _] = items.as_slice() else {
+            panic!("expected [textures, a.txt]");
+        };
+        let [blocks, _] = textures.children.as_slice() else {
+            panic!("expected [blocks, ui.png] under textures");
+        };
+        assert!(blocks.is_expanded(), "user-expanded deeper folder opens");
+
+        let collapsed = [(SharedString::from("textures"), false)]
+            .into_iter()
+            .collect();
+        let (items, _) = build_tree(Some(&entries), &collapsed);
+        let [textures, _] = items.as_slice() else {
+            panic!("expected [textures, a.txt]");
+        };
+        assert!(!textures.is_expanded(), "user-collapsed top folder stays shut");
     }
 }

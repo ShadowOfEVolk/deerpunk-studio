@@ -1074,3 +1074,135 @@ fn render_rmlui_canvas() {
         panel_colors.len()
     );
 }
+
+// ===== Files tree: folder click-toggle + persistence across rebuilds =====
+//
+// gpui-kit's tree expands/collapses a folder row on click (TreeState's own
+// entry on_click — the panel supplies only content). The Files panel records
+// those toggles and re-applies them when a new scan rebuilds the items
+// (`set_items` resets expansion otherwise). Rows are located through the
+// per-row `debug_selector` ("files-row-<rel>"), recorded only with gpui's
+// test-support; unlike the pixel tests above this needs synthetic clicks, so
+// it runs on gpui's `TestAppContext` (TestPlatform) instead of the headless
+// renderer — assertions are element-level (painted row bounds), which
+// NoopTextSystem pixels cannot provide for rows that differ only by glyphs.
+
+/// Expands into a gpui test running the body on macOS/Linux, skipping
+/// elsewhere (parity with the pixel tests above; TestPlatform itself is
+/// portable, but the FA/theme init used below mirrors the gated panels).
+#[gpui::test]
+fn files_tree_folder_click_toggles_and_persists(cx: &mut gpui::TestAppContext) {
+    use deerpunk_studio::assets::{AssetEntry, AssetKind, ScanResult};
+    use gpui::Modifiers;
+    use gpui_kit::AppContext as _;
+
+    fn entry(rel: &str) -> AssetEntry {
+        AssetEntry {
+            rel: rel.into(),
+            kind: AssetKind::Config,
+            size: 1,
+            pack: None,
+        }
+    }
+    let scan_full = || {
+        vec![
+            entry("a.txt"),
+            entry("textures/blocks/stone.png"),
+            entry("textures/ui.png"),
+        ]
+    };
+
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+    let state = cx.update(|cx| cx.new(|_| state::StudioState::new()));
+    let bus = cx.update(|cx| cx.new(|_| viewers::ViewerBus::new()));
+    let (_panel, window) =
+        cx.add_window_view(|_, cx| files::FilesPanel::new(state.clone(), bus.clone(), cx));
+
+    fn set_scan(
+        window: &mut gpui::VisualTestContext,
+        state: &gpui::Entity<state::StudioState>,
+        entries: Vec<AssetEntry>,
+    ) {
+        window.update(|_, cx| {
+            state.update(cx, |s, cx| {
+                s.scan = Some(ScanResult {
+                    entries,
+                    errors: Vec::new(),
+                });
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    set_scan(window, &state, scan_full());
+    let blocks = window
+        .debug_bounds("files-row-textures/blocks")
+        .expect("nested folder row painted");
+    assert!(
+        window
+            .debug_bounds("files-row-textures/blocks/stone.png")
+            .is_none(),
+        "deeper folder must start collapsed (top level expanded)"
+    );
+
+    // Click 1: the nested folder opens and its file appears below it.
+    window.simulate_click(blocks.center(), Modifiers::default());
+    window.run_until_parked();
+    window.update(|window, cx| window.draw(cx).clear(cx));
+    let stone = window
+        .debug_bounds("files-row-textures/blocks/stone.png")
+        .expect("click on folder must reveal its children");
+    assert!(
+        stone.origin.y > blocks.origin.y,
+        "revealed child must render below the folder row"
+    );
+
+    // Click 2: the same folder collapses again.
+    window.simulate_click(blocks.center(), Modifiers::default());
+    window.run_until_parked();
+    window.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        window
+            .debug_bounds("files-row-textures/blocks/stone.png")
+            .is_none(),
+        "second click must collapse the folder"
+    );
+
+    // Re-open, then force a tree rebuild (new scan with one more file): the
+    // expansion must survive `set_items`.
+    window.simulate_click(blocks.center(), Modifiers::default());
+    window.run_until_parked();
+    let mut rescan = scan_full();
+    rescan.push(entry("textures/blocks/moss.png"));
+    set_scan(window, &state, rescan);
+    window
+        .debug_bounds("files-row-textures/blocks/stone.png")
+        .expect("expanded folder survives a rebuild");
+    window
+        .debug_bounds("files-row-textures/blocks/moss.png")
+        .expect("new file appears inside the remembered expansion");
+
+    // A folder that vanishes from a scan drops its stale toggle: rescanning
+    // without `blocks/`, then back, leaves the folder collapsed by default.
+    set_scan(window, &state, vec![entry("a.txt"), entry("textures/ui.png")]);
+    set_scan(window, &state, scan_full());
+    let blocks_again = window
+        .debug_bounds("files-row-textures/blocks")
+        .expect("folder row back");
+    assert!(
+        window
+            .debug_bounds("files-row-textures/blocks/stone.png")
+            .is_none(),
+        "stale expansion must not leak across scans"
+    );
+    assert!(
+        blocks_again.origin.y == blocks.origin.y,
+        "folder row position unchanged after the round-trip"
+    );
+}
