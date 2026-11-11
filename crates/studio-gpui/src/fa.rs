@@ -73,6 +73,8 @@ pub const CHEVRON_DOWN: char = '\u{f078}';
 pub const LINK: char = '\u{f0c1}';
 #[allow(dead_code)]
 pub const DATABASE: char = '\u{f1c0}';
+#[allow(dead_code)]
+pub const COPY: char = '\u{f0c5}';
 /// `square-terminal` (e32a) is not in FA Free 6.7.2 — same glyph as
 /// [`TERMINAL`].
 #[allow(dead_code)]
@@ -154,4 +156,109 @@ pub fn register(cx: &mut App) {
     cx.text_system()
         .add_fonts(vec![Cow::Borrowed(FA_SOLID)])
         .expect("failed to register the embedded Font Awesome 6 Free font");
+}
+
+// Tofu guard: every codepoint in the table above must exist in the embedded
+// font's cmap — a miss renders .notdef boxes instead of the icon. The headless
+// text system cannot rasterize font glyphs, so this byte-level check is the
+// real verification of "the glyph exists in FA Free".
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal cmap reader for the embedded TTF (format 4 and 12 subtables —
+    /// everything FA Free ships), std-only.
+    fn covered_codepoints() -> std::collections::BTreeSet<u32> {
+        let data = FA_SOLID;
+        let be16 = |off: usize| -> usize {
+            u16::from_be_bytes([data[off], data[off + 1]]) as usize
+        };
+        let be32 = |off: usize| -> u32 {
+            u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
+        let num_tables = be16(4);
+        let mut cmap = None;
+        for t in 0..num_tables {
+            let rec = 12 + 16 * t;
+            if data[rec..rec + 4] == *b"cmap" {
+                cmap = Some(be32(rec + 8) as usize);
+            }
+        }
+        let cmap = cmap.expect("embedded FA font must carry a cmap table");
+        let mut best = None;
+        for i in 0..be16(cmap + 2) {
+            // Encoding record: platformID(2) + encodingID(2) + offset(4) —
+            // the offset field sits at record_start + 4 (records begin at
+            // cmap + 4, after version + numTables).
+            let off = cmap + be32(cmap + 8 + 8 * i) as usize;
+            let format = be16(off);
+            match format {
+                12 => best = Some(off),
+                4 if best.is_none() => best = Some(off),
+                _ => {}
+            }
+        }
+        let off = best.expect("cmap must contain a format 4 or 12 subtable");
+        let mut covered = std::collections::BTreeSet::new();
+        match be16(off) {
+            4 => {
+                let seg_x2 = be16(off + 6);
+                let seg = seg_x2 / 2;
+                for i in 0..seg {
+                    let start = be16(off + 14 + 2 * seg + 2 * i) as u32;
+                    let end = be16(off + 14 + 2 * i).min(0xFFFF) as u32;
+                    covered.extend(start..=end);
+                }
+            }
+            12 => {
+                let groups = be32(off + 12) as usize;
+                for g in 0..groups {
+                    let rec = off + 16 + 12 * g;
+                    let (start, end) = (be32(rec), be32(rec + 4));
+                    // The FA table's ranges are small; keep the scan bounded
+                    // anyway in case of a pathological group.
+                    if end - start < 1 << 20 {
+                        covered.extend(start..=end);
+                    }
+                }
+            }
+            other => panic!("unexpected cmap format {other}"),
+        }
+        covered
+    }
+
+    #[test]
+    fn every_icon_codepoint_exists_in_the_embedded_font() {
+        let covered = covered_codepoints();
+        let table: &[(&str, char)] = &[
+            ("GAMEPAD", GAMEPAD),
+            ("PLAY", PLAY),
+            ("STOP", STOP),
+            ("SPINNER", SPINNER),
+            ("ACTIVITY", ACTIVITY),
+            ("FOLDER", FOLDER),
+            ("FOLDER_OPEN", FOLDER_OPEN),
+            ("SLIDERS", SLIDERS),
+            ("GEAR", GEAR),
+            ("FLAME", FLAME),
+            ("TERMINAL", TERMINAL),
+            ("PLUG", PLUG),
+            ("PLUG_CIRCLE_XMARK", PLUG_CIRCLE_XMARK),
+            ("ROTATE", ROTATE),
+            ("CIRCLE_EXCLAMATION", CIRCLE_EXCLAMATION),
+            ("CHECK", CHECK),
+            ("CHEVRON_DOWN", CHEVRON_DOWN),
+            ("LINK", LINK),
+            ("DATABASE", DATABASE),
+            ("COPY", COPY),
+            ("SQUARE_TERMINAL", SQUARE_TERMINAL),
+        ];
+        for (name, code) in table {
+            assert!(
+                covered.contains(&(*code as u32)),
+                "{name} (U+{:04X}) is missing from fa-solid-900.ttf — it would render as tofu",
+                *code as u32
+            );
+        }
+    }
 }

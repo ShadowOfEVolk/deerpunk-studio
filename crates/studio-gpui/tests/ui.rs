@@ -66,8 +66,14 @@ mod topbar;
 #[path = "../src/viewers.rs"]
 mod viewers;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
+use deerpunk_studio::diagnostics::{Diag, DiagSeverity};
 use image::RgbaImage;
 
 /// GPUI supplies a real offscreen renderer on macOS (Metal) and Linux (WGPU)
@@ -219,144 +225,256 @@ fn render_workspace_headless() {
     assert_painted("dock", w / 4, h / 12, 3 * w / 4, 3 * h / 8);
 }
 
-/// The animated [`fa::spinner`]: the active variant must paint the rotating
-/// ring (and actually rotate between frames — the animation ticks), the
-/// inactive variant must paint the same ring statically. Unlike the chrome
-/// test, this keys on real pixels: the spinner is an SVG alpha mask
-/// rasterized by the renderer, not a font glyph, so NoopTextSystem does not
-/// blank it.
+// ===== Virtualization: big-list headless render behavior =====
+//
+// Both panels render through `uniform_list` (flat visible-row vector, fixed
+// row height). These are functional tests only — a several-hundred-row
+// synthetic payload renders headless, and collapsing a row (chevron handler
+// body) changes the rasterized frame. Timing/perf measurements are run
+// one-off by hand, never asserted here.
+
+/// Synthetic entity with `components × props` scalar properties (plus the
+/// transform group each component carries) — around 200 logical rows with
+/// the default call: big next to the ~30-row viewport, cheap to render.
+fn big_entity(components: usize, props: usize) -> serde_json::Value {
+    let comps: Vec<serde_json::Value> = (0..components)
+        .map(|c| {
+            let kv: serde_json::Map<String, serde_json::Value> = (0..props)
+                .map(|p| {
+                    let v = if p % 10 == 0 {
+                        serde_json::json!(format!("long-value-{}-{}", p, "x".repeat(80)))
+                    } else {
+                        serde_json::json!(p * 3)
+                    };
+                    (format!("prop_{p}"), v)
+                })
+                .collect();
+            serde_json::json!({
+                "slug": format!("comp_{c}"),
+                "data": {
+                    "transform": { "x": c, "y": c * 7, "z": 0 },
+                    "props": kv,
+                },
+            })
+        })
+        .collect();
+    serde_json::json!({ "index": 1, "name": "bench_entity", "prefabId": 7, "components": comps })
+}
+
+/// Distinct-pixel count between two rasters.
+fn diff_pixels(a: &RgbaImage, b: &RgbaImage) -> usize {
+    a.pixels().zip(b.pixels()).filter(|(x, y)| x.0 != y.0).count()
+}
+
 #[test]
-fn spinner_headless_renders_and_rotates() {
+fn live_detail_large_list_headless_renders_and_collapses() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    render_spinner_headless();
+    render_live_detail_large_list();
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    eprintln!("spinner ring: skipped; GPUI has no headless renderer on this platform");
+    eprintln!("live_detail big list: skipped; GPUI has no headless renderer on this platform");
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn render_spinner_headless() {
+fn render_live_detail_large_list() {
     use gpui_kit::{
-        AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement, NoopTextSystem,
-        ParentElement as _, Point, Render, Styled as _, Window, WindowBounds, WindowOptions,
-        assets::Assets, div, px, size,
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, px, size,
     };
 
-    struct SpinnerRoot {
-        active: bool,
-    }
+    let entity = big_entity(4, 40);
+    let map: HashMap<u32, String> = [(7u32, "player".to_string())].into_iter().collect();
 
-    impl Render for SpinnerRoot {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .bg(theme::BG)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(fa::spinner(
-                    px(48.),
-                    theme::YELLOW,
-                    "headless-spinner",
-                    self.active,
-                ))
-        }
-    }
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
 
-    // A 48px yellow ring on the near-black `theme::BG`: ring pixels carry
-    // the yellow tint (r > g > b), background and any antialiasing stay
-    // well below it.
-    let yellowish = |shot: &RgbaImage| -> usize {
-        let (w, h) = (shot.width(), shot.height());
-        let mut count = 0usize;
-        for y in h / 4..h * 3 / 4 {
-            for x in w / 4..w * 3 / 4 {
-                let [r, g, b, _] = shot.get_pixel(x, y).0;
-                if g as i32 > b as i32 + 30 && r as i32 > g as i32 - 30 && g > 60 {
-                    count += 1;
-                }
-            }
-        }
-        count
-    };
-
-    let boot = |active: bool, delay: Option<std::time::Duration>| -> (usize, usize) {
-        let mut cx = HeadlessAppContext::with_platform(
-            Arc::new(NoopTextSystem::new()),
-            Arc::new(Assets),
-            gpui_kit::platform::current_headless_renderer,
-        );
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            theme::apply(cx);
+    let (window, view) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|_| live_detail::LiveDetail::new(&entity, &map)),
+            )
+            .expect("open headless live-detail window")
         });
 
-        let window = cx
-            .update(|cx| {
-                gpui_kit::open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds {
-                            origin: Point::default(),
-                            size: size(px(200.), px(200.)),
-                        })),
-                        focus: false,
-                        show: false,
-                        ..Default::default()
-                    },
-                    cx,
-                    |_, cx| cx.new(|_| SpinnerRoot { active }),
-                )
-                .expect("open headless spinner window")
-            })
-            .0;
+    cx.update_window(window, |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .expect("render live-detail frame");
+    let shot_open = cx.capture_screenshot(window).expect("capture open frame");
 
-        cx.update_window(window, |_, window, cx| {
-            window.refresh();
-            window.draw(cx).clear(cx);
-        })
-        .expect("render first spinner frame");
-        let first = cx.capture_screenshot(window).expect("capture first frame");
-        let first_ring = yellowish(&first);
+    // The ~240-row payload must actually paint (card fills/borders, chevron
+    // icon shapes — text itself is noop under NoopTextSystem).
+    let mut colors = HashSet::new();
+    for y in 20..shot_open.height() - 20 {
+        for x in 10..shot_open.width() - 10 {
+            colors.insert(shot_open.get_pixel(x, y).0);
+        }
+    }
+    assert!(
+        colors.len() >= 8,
+        "live-detail body is nearly uniform ({} colors): the list did not render",
+        colors.len()
+    );
 
-        // For the animated ring: redraw after a real 120ms — one tick at
-        // the 12 fps cap, ~43° of the 1s revolution — and require the
-        // raster to differ. The root is otherwise static, so any change in
-        // the center region is the ring rotating.
-        let second_ring = match delay {
-            None => first_ring,
-            Some(delay) => {
-                // The headless dispatcher runs a *virtual* clock: real
-                // sleeps do not move `Instant::now()`, so the animation
-                // phase must be advanced explicitly.
-                cx.advance_clock(delay);
-                cx.update_window(window, |_, window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                })
-                .expect("render second spinner frame");
-                let second = cx.capture_screenshot(window).expect("capture second frame");
-                let second_ring = yellowish(&second);
-                assert!(
-                    first.pixels().zip(second.pixels()).any(|(a, b)| a.0 != b.0),
-                    "animated spinner did not rotate between frames"
-                );
-                second_ring
-            }
-        };
-        (first_ring, second_ring)
+    // Collapse the first component's card through the same toggle the
+    // chevron click handler runs: its ~43 rows must drop out of the frame.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle("comp_0", cx));
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .expect("collapse re-render");
+    let shot_collapsed = cx
+        .capture_screenshot(window)
+        .expect("capture collapsed frame");
+    let diff = diff_pixels(&shot_open, &shot_collapsed);
+    assert!(
+        diff > 1000,
+        "collapsing comp_0 changed only {diff} pixels: collapse does not alter the rendered list"
+    );
+}
+
+#[test]
+fn diagnostics_list_headless_renders_and_expands() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    render_diagnostics_list();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    eprintln!("diagnostics big list: skipped; GPUI has no headless renderer on this platform");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render_diagnostics_list() {
+    use gpui_kit::{
+        AppContext as _, Bounds, HeadlessAppContext, NoopTextSystem, Point, WindowBounds,
+        WindowOptions, assets::Assets, px, size,
     };
 
-    // Active: ring paints and rotates. Inactive: ring paints, no animation
-    // element, so no second frame is drawn (delay None).
-    let (active_ring, _) = boot(true, Some(std::time::Duration::from_millis(120)));
-    let (inactive_ring, _) = boot(false, None);
-
-    assert!(
-        active_ring >= 20,
-        "active spinner painted no yellow ring pixels ({active_ring})"
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(NoopTextSystem::new()),
+        Arc::new(Assets),
+        gpui_kit::platform::current_headless_renderer,
     );
+    cx.update(|cx| {
+        fa::register(cx);
+        gpui_kit::init(cx);
+        theme::apply(cx);
+    });
+
+    let state = cx.update(|cx| cx.new(|_| state::StudioState::new()));
+    let (window, panel) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| {
+                    cx.new(|cx| diagnostics::DiagnosticsPanel::with_bus(state.clone(), None, cx))
+                },
+            )
+            .expect("open headless diagnostics window")
+        });
+
+    // 200 diagnostics (10:1 warnings:errors), two of the leading ones
+    // expanded so their snippet boxes rasterize (text and font icons are
+    // noop glyphs under NoopTextSystem).
+    let diags: Vec<Diag> = (0..200)
+        .map(|i| {
+            let error = i % 10 == 0;
+            let line = 10 + (i % 90) as u32;
+            Diag {
+                severity: if error {
+                    DiagSeverity::Error
+                } else {
+                    DiagSeverity::Warning
+                },
+                message: format!(
+                    "unused variable `value_{i}` in `frame_handler_{i}` — consider removing it or prefixing with an underscore"
+                ),
+                rendered: Some(format!(
+                    "warning: unused variable `value_{i}`\n  --> src/game/frame_{i}.rs:{line}:9\n   |\n{line}  |     let value_{i} = compute({i});\n   |         ^^^^^^^ help: prefix with an underscore\n"
+                )),
+                file: Some(format!("src/game/frame_{i}.rs")),
+                line: Some(line),
+                col: Some(9),
+                code: Some(if error {
+                    "E0382".to_string()
+                } else {
+                    "unused_variables".to_string()
+                }),
+            }
+        })
+        .collect();
+    cx.update(|cx| panel.update(cx, |p, _| p.push_for_test(diags)));
+    cx.update(|cx| {
+        panel.update(cx, |p, _| {
+            // Both are errors → both live in the first section, on screen.
+            p.set_expanded_for_test(0, true);
+            p.set_expanded_for_test(10, true);
+        })
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .expect("render diagnostics frame");
+    let shot_open = cx.capture_screenshot(window).expect("capture open frame");
+
+    // List body painted: snippet CARD fills + severity-colored borders, not
+    // just the empty state's centered check glyph.
+    let mut colors = HashSet::new();
+    for y in 40..shot_open.height() - 20 {
+        for x in 10..shot_open.width() - 10 {
+            colors.insert(shot_open.get_pixel(x, y).0);
+        }
+    }
     assert!(
-        inactive_ring >= 20,
-        "inactive spinner painted no static ring pixels ({inactive_ring})"
+        colors.len() >= 16,
+        "diagnostics body is nearly uniform ({} colors): the 200-row list did not render",
+        colors.len()
+    );
+
+    // Collapse the second expanded diagnostic (its snippet sits inside the
+    // visible rows): the raster must change.
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |p, _| p.set_expanded_for_test(10, false));
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .expect("collapse re-render");
+    let shot_collapsed = cx
+        .capture_screenshot(window)
+        .expect("capture collapsed frame");
+    let diff = diff_pixels(&shot_open, &shot_collapsed);
+    assert!(
+        diff > 500,
+        "collapsing a diagnostic changed only {diff} pixels: snippet rows do not render"
     );
 }

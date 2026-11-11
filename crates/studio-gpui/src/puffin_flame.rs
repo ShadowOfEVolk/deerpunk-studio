@@ -676,22 +676,251 @@ pub fn color_from_duration(ns: NanoSecond) -> (f32, f32, f32, f32) {
 }
 
 // ---------------------------------------------------------------------------
+// Trace text export (assignment: copy flamegraph as indented text)
+// ---------------------------------------------------------------------------
+//
+// The trace trees are built here from the `ThreadStreams` data directly, NOT
+// from `FlameLayout::build`: the layout's merge walk flattens every merged
+// scope onto row 0 (fine for painting rows, wrong for a text hierarchy), so
+// this module walks raw streams and `MergeScope` trees with true depths.
+
+/// Adaptive duration label: ms with two decimals from 1 ms up, µs down to
+/// 1 µs, plain ns below.
+pub fn format_duration(ns: NanoSecond) -> String {
+    if ns >= 1_000_000 {
+        format!("{:.2} ms", ns as f64 * 1e-6)
+    } else if ns >= 1_000 {
+        format!("{:.2} µs", ns as f64 * 1e-3)
+    } else {
+        format!("{ns} ns")
+    }
+}
+
+/// One node of a copy-trace tree: a scope with its true depth and children
+/// (`merge_pieces` mirrors [`ScopeEntry::merge_pieces`]).
+pub struct TraceNode {
+    pub id: ScopeId,
+    pub data: String,
+    pub depth: usize,
+    pub start_ns: NanoSecond,
+    pub end_ns: NanoSecond,
+    pub merge_pieces: usize,
+    pub children: Vec<TraceNode>,
+}
+
+impl TraceNode {
+    pub fn duration_ns(&self) -> NanoSecond {
+        self.end_ns - self.start_ns
+    }
+}
+
+/// Recursive raw-stream walk (`walk_raw` as a tree instead of a flat list).
+fn raw_node(stream: &Stream, scope: &Scope, depth: usize) -> TraceNode {
+    let children: Vec<Scope> = Reader::with_offset(stream, scope.child_begin_position)
+        .and_then(|r| r.read_top_scopes())
+        .unwrap_or_default();
+    TraceNode {
+        id: scope.id,
+        data: scope.record.data.to_owned(),
+        depth,
+        start_ns: scope.record.start_ns,
+        end_ns: scope.record.stop_ns(),
+        merge_pieces: 0,
+        children: children
+            .iter()
+            .map(|child| raw_node(stream, child, depth + 1))
+            .collect(),
+    }
+}
+
+/// Recursive merged-scope walk (`MergeScope` trees carry relative starts).
+fn merge_node(merge: &MergeScope, parent_start_ns: NanoSecond, depth: usize) -> TraceNode {
+    let start_ns = parent_start_ns + merge.relative_start_ns;
+    let end_ns = start_ns + merge.duration_per_frame_ns;
+    TraceNode {
+        id: merge.id,
+        data: merge.data.to_string(),
+        depth,
+        start_ns,
+        end_ns,
+        merge_pieces: merge.num_pieces,
+        children: merge
+            .children
+            .iter()
+            .map(|child| merge_node(child, start_ns, depth + 1))
+            .collect(),
+    }
+}
+
+/// Copy-trace trees for every visible thread, in [`FlameOptions::sorted_threads`]
+/// order (so `thread_ix` matches [`FlameLayout::threads`] indices). Raw or
+/// merged scopes per `opts.merge_scopes`.
+pub fn trace_trees(
+    sel: &SelectedFrames,
+    opts: &FlameOptions,
+) -> Vec<(ThreadInfo, Vec<TraceNode>)> {
+    opts.sorted_threads(sel.threads.keys().cloned().collect())
+        .into_iter()
+        .filter(|info| !opts.hidden_threads.contains(&info.name))
+        .map(|info| {
+            let data = &sel.threads[&info];
+            let roots = if opts.merge_scopes {
+                data.merged_scopes
+                    .iter()
+                    .map(|m| merge_node(m, 0, 0))
+                    .collect()
+            } else {
+                let mut roots = Vec::new();
+                for stream_info in &data.streams {
+                    if let Ok(top) = Reader::from_start(&stream_info.stream).read_top_scopes() {
+                        roots.extend(
+                            top.into_iter()
+                                .map(|scope| raw_node(&stream_info.stream, &scope, 0)),
+                        );
+                    }
+                }
+                roots
+            };
+            (info, roots)
+        })
+        .collect()
+}
+
+/// Resolved scope label: the `ScopeDetails` name (like the painted label),
+/// falling back to `<missing>` for unknown ids.
+fn scope_label(id: &ScopeId, collection: &ScopeCollection) -> String {
+    collection
+        .fetch_by_id(id)
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|| "<missing>".to_string())
+}
+
+/// Integer percent `dur` is of `base` (`None` when `base` is empty).
+fn percent_of(dur: NanoSecond, base: NanoSecond) -> Option<i64> {
+    (base > 0).then(|| ((dur as f64 / base as f64) * 100.0).round() as i64)
+}
+
+/// One line per node, two-space indent per depth level relative to
+/// `base_depth` (`shift` adds leading indent under a thread header).
+/// `parent_ns` denominates the percent: the parent scope's duration, or the
+/// thread total for roots. Line format: `name  duration  pct%  [merged N]`.
+fn render_node(
+    node: &TraceNode,
+    parent_ns: NanoSecond,
+    base_depth: usize,
+    shift: usize,
+    collection: &ScopeCollection,
+    out: &mut String,
+) {
+    out.push_str(&"  ".repeat(node.depth - base_depth + shift));
+    out.push_str(&scope_label(&node.id, collection));
+    out.push_str("  ");
+    let dur = node.duration_ns();
+    out.push_str(&format_duration(dur));
+    if let Some(pct) = percent_of(dur, parent_ns) {
+        out.push_str(&format!("  {pct}%"));
+    }
+    if node.merge_pieces > 1 {
+        out.push_str(&format!("  [merged {}]", node.merge_pieces));
+    }
+    out.push('\n');
+    for child in &node.children {
+        render_node(child, dur, base_depth, shift, collection, out);
+    }
+}
+
+/// Text for one thread's trees; `None` when the thread has no scopes
+/// (hidden or collapsed-empty). `thread  total` header + indented tree.
+pub fn thread_trace_text(
+    sel: &SelectedFrames,
+    opts: &FlameOptions,
+    collection: &ScopeCollection,
+    thread_ix: usize,
+) -> Option<String> {
+    let (info, roots) = trace_trees(sel, opts).into_iter().nth(thread_ix)?;
+    if roots.is_empty() {
+        return None;
+    }
+    let total = roots.iter().fold(0, |acc, n| acc.max(n.end_ns))
+        - roots.iter().fold(NanoSecond::MAX, |acc, n| acc.min(n.start_ns));
+    let mut text = format!("{}  {}\n", info.name, format_duration(total));
+    let mut body = String::new();
+    for root in &roots {
+        render_node(root, total, 0, 1, collection, &mut body);
+    }
+    body.pop(); // trailing newline
+    text.push_str(&body);
+    Some(text)
+}
+
+/// All threads, one `thread  total` block each, blank-line separated.
+pub fn frame_trace_text(
+    sel: &SelectedFrames,
+    opts: &FlameOptions,
+    collection: &ScopeCollection,
+) -> String {
+    let mut blocks = Vec::new();
+    for thread_ix in 0..sel.threads.len() {
+        if let Some(block) = thread_trace_text(sel, opts, collection, thread_ix) {
+            blocks.push(block);
+        }
+    }
+    blocks.join("\n\n")
+}
+
+/// One scope subtree: the scope line (no percent) plus its indented children.
+/// `entry` is the flamegraph hit (canvas entry); the matching node is looked
+/// up by its unique `(id, start, end)` triple.
+pub fn span_trace_text(
+    sel: &SelectedFrames,
+    opts: &FlameOptions,
+    collection: &ScopeCollection,
+    entry: &ScopeEntry,
+) -> Option<String> {
+    fn find<'a>(nodes: &'a [TraceNode], entry: &ScopeEntry) -> Option<&'a TraceNode> {
+        nodes.iter().find_map(|node| {
+            if node.id == entry.id
+                && node.start_ns == entry.start_ns
+                && node.end_ns == entry.end_ns
+            {
+                Some(node)
+            } else {
+                find(&node.children, entry)
+            }
+        })
+    }
+    for (_, roots) in trace_trees(sel, opts) {
+        if let Some(node) = find(&roots, entry) {
+            let mut text = String::new();
+            // Root denominator 0 → the span line carries no percent (it is
+            // its own reference); children denominate against it.
+            render_node(node, 0, node.depth, 0, collection, &mut text);
+            text.pop(); // trailing newline
+            return Some(text);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests: aggregation over synthetic frames (explicit imports, no super::*)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use puffin::{
-        NanoSecond, ScopeCollection, ScopeId, Stream, StreamInfo, ThreadInfo, UnpackedFrameData,
-    };
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
+    use puffin::{
+        NanoSecond, ScopeCollection, ScopeDetails, ScopeId, Stream, StreamInfo, ThreadInfo,
+        UnpackedFrameData,
+    };
+
     use crate::puffin_flame::{
         Filter, FlameLayout, FlameOptions, ScopeStats, SelectedFrames, SortKey, SortOrder, StatRow,
-        build_stat_rows, collect_scope_stats, color_from_duration, grid_text, sort_rows,
-        stats_totals,
+        build_stat_rows, collect_scope_stats, color_from_duration, format_duration, grid_text,
+        sort_rows, stats_totals, frame_trace_text, span_trace_text, thread_trace_text, trace_trees,
     };
 
     fn scope_id(n: u32) -> ScopeId {
@@ -994,5 +1223,172 @@ mod tests {
         let (r0, g0, b0, _) = color_from_duration(100_000);
         let (r1, g1, b1, _) = color_from_duration(33_000_000);
         assert!(b0 > b1 && g1 > g0 && r1 > r0);
+    }
+
+    /// Registers the example scopes with puffin's global registry (puffin
+    /// owns id allocation) and returns their raw u32 ids: (update_world,
+    /// particles).
+    fn register_example_scopes() -> (u32, u32) {
+        let ids = puffin::GlobalProfiler::lock().register_user_scopes(&[
+            ScopeDetails::from_scope_name("update_world"),
+            ScopeDetails::from_scope_name("particles"),
+        ]);
+        (ids[0].0.get(), ids[1].0.get())
+    }
+
+    /// A fresh `GlobalFrameView` whose `ScopeCollection` already resolves the
+    /// example scopes: puffin's `emit_scope_snapshot` + one real macro-
+    /// profiled frame push the registered details through the supported
+    /// `FrameData::scope_delta` propagation path.
+    fn flushed_view() -> puffin::GlobalFrameView {
+        let view = puffin::GlobalFrameView::default();
+        puffin::set_scopes_on(true);
+        fn flush() {
+            puffin::profile_function!();
+        }
+        flush();
+        puffin::GlobalProfiler::lock().new_frame();
+        view
+    }
+
+    /// `n` synthetic frames on thread "Main", each `update_world`
+    /// [base, base+100ms) containing `particles` [base+10ms, base+50ms), fed
+    /// through a `GlobalFrameView` exactly like production data, so the
+    /// returned selection resolves real names. Indices start at 1000 to stay
+    /// clear of the index of the propagation flush frame.
+    fn named_frames(n: usize) -> (SelectedFrames, ScopeCollection) {
+        let th = thread("Main");
+        let (top, leaf) = register_example_scopes();
+        let view = flushed_view();
+
+        for i in 0..n {
+            let base: NanoSecond = 200_000_000_000 + (i as NanoSecond) * 200_000_000;
+            let mut s = Stream::default();
+            write_scope(
+                &mut s,
+                (top, "", base, base + 100_000_000),
+                &[((leaf, "", base + 10_000_000, base + 50_000_000), vec![])],
+            );
+            let streams = BTreeMap::from([(th.clone(), StreamInfo::parse(s).expect("parse"))]);
+            view.lock()
+                .add_frame(Arc::new(
+                    puffin::FrameData::new(1000 + i as u64, streams, Vec::new(), true)
+                        .expect("frame"),
+                ));
+        }
+
+        let fv = view.lock();
+        let collection = fv.scope_collection().clone();
+        // Parallel tests' flush frames also land in this view (every
+        // GlobalFrameView sinks the global feed); pin to our own high
+        // indices so the selection is deterministic regardless of timing.
+        let frames: Vec<_> = fv
+            .latest_frames(n + 16)
+            .filter(|f| f.frame_index() >= 1000)
+            .filter_map(|f| f.unpacked().ok())
+            .collect();
+        assert_eq!(frames.len(), n, "expected exactly our {n} synthetic frames");
+        (
+            SelectedFrames::try_from_iter(&collection, frames.into_iter()).expect("frames"),
+            collection,
+        )
+    }
+
+    #[test]
+    fn format_duration_is_adaptive() {
+        assert_eq!(format_duration(78_300_000), "78.30 ms");
+        assert_eq!(format_duration(45_200_000), "45.20 ms");
+        assert_eq!(format_duration(12_000), "12.00 µs");
+        assert_eq!(format_duration(999), "999 ns");
+        assert_eq!(format_duration(0), "0 ns");
+    }
+
+    /// The trace tests drive puffin's process-global registry + profiler
+    /// (`GlobalProfiler`/`GlobalFrameView` singletons); run them all inside
+    /// one `#[test]` so concurrent test threads can never interleave those
+    /// global lock orders.
+    #[test]
+    fn trace_text_covers_hierarchy_percent_merge_and_threads() {
+        // --- raw view: header, hierarchy, percents (the contract example) ---
+        let (sel, collection) = named_frames(1);
+        let text =
+            thread_trace_text(&sel, &FlameOptions::default(), &collection, 0).expect("thread");
+        let expected = "\
+Main  100.00 ms
+  update_world  100.00 ms  100%
+    particles  40.00 ms  40%";
+        assert_eq!(text, expected);
+
+        // --- span subtree: root line + children only ---
+        let layout = FlameLayout::build(&sel, &FlameOptions::default());
+        let text = span_trace_text(&sel, &FlameOptions::default(), &collection, &layout.scopes[0])
+            .expect("span");
+        assert_eq!(text, "update_world  100.00 ms\n  particles  40.00 ms  40%");
+        // The leaf: a single line, no percent (it is the root of its trace).
+        let text = span_trace_text(&sel, &FlameOptions::default(), &collection, &layout.scopes[1])
+            .expect("span");
+        assert_eq!(text, "particles  40.00 ms");
+
+        // --- frame copy: one block per thread, blank-line separated ---
+        let th = thread("Main");
+        let (top, leaf) = register_example_scopes();
+        let view = flushed_view();
+        // Main: update_world[0,100ms) > particles[10ms,50ms); Render: update_world[0,30ms).
+        let mut main = Stream::default();
+        write_scope(
+            &mut main,
+            (top, "", 0, 100_000_000),
+            &[((leaf, "", 10_000_000, 50_000_000), vec![])],
+        );
+        let mut render = Stream::default();
+        write_scope(&mut render, (top, "", 0, 30_000_000), &[]);
+        let streams = BTreeMap::from([
+            (th, StreamInfo::parse(main).expect("parse")),
+            (thread("Render"), StreamInfo::parse(render).expect("parse")),
+        ]);
+        view.lock().add_frame(Arc::new(
+            puffin::FrameData::new(1000, streams, Vec::new(), true).expect("frame"),
+        ));
+        let fv = view.lock();
+        let collection = fv.scope_collection().clone();
+        let frames: Vec<_> = fv
+            .latest_frames(8)
+            .filter(|f| f.frame_index() >= 1000)
+            .filter_map(|f| f.unpacked().ok())
+            .collect();
+        assert_eq!(frames.len(), 1, "expected exactly our synthetic frame");
+        let sel = SelectedFrames::try_from_iter(&collection, frames.into_iter()).expect("frames");
+        let text = frame_trace_text(&sel, &FlameOptions::default(), &collection);
+        assert_eq!(
+            text,
+            "Main  100.00 ms\n  update_world  100.00 ms  100%\n    particles  40.00 ms  40%\n\
+             \nRender  30.00 ms\n  update_world  30.00 ms  100%"
+        );
+        drop(fv);
+
+        // --- merge view: pieces marked, true hierarchy depths ---
+        let (sel, collection) = named_frames(2);
+        let mut opts = FlameOptions::default();
+        opts.merge_scopes = true;
+
+        let trees = trace_trees(&sel, &opts);
+        assert_eq!(trees.len(), 1);
+        let roots = &trees[0].1;
+        assert_eq!(roots.len(), 1, "same id+data merged across frames");
+        let root = &roots[0];
+        assert_eq!(root.depth, 0);
+        assert_eq!(root.merge_pieces, 2, "one piece per frame");
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].depth, 1, "true hierarchy depths");
+        assert_eq!(root.children[0].merge_pieces, 2, "one piece per frame");
+
+        let text = thread_trace_text(&sel, &opts, &collection, 0).expect("thread");
+        // Merged duration is the per-frame average: 100 ms root, 40 ms child.
+        assert_eq!(
+            text,
+            "Main  100.00 ms
+  update_world  100.00 ms  100%  [merged 2]
+    particles  40.00 ms  40%  [merged 2]"
+        );
     }
 }

@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -19,6 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use deerpunk_studio::diagnostics::{Diag, DiagSeverity, drain_diags};
+use deerpunk_studio::runner::RunState;
 
 use crate::fa;
 use crate::state::StudioState;
@@ -34,6 +36,39 @@ const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 /// the shared icon table stays with its owner.
 const TRIANGLE_EXCLAMATION: char = '\u{f071}';
 
+/// Uniform slot height for every list row — `uniform_list` lays all rows
+/// out with one measured height. 24px fits the headline line and centers a
+/// 12px snippet line in its slot.
+const DIAG_ROW_H: f32 = 24.;
+
+/// One visible row of the flattened diagnostics list.
+#[derive(Clone)]
+struct DiagRow {
+    kind: DiagRowKind,
+}
+
+#[derive(Clone)]
+enum DiagRowKind {
+    /// Severity section heading above its group (the old `section_label`).
+    Section { text: String, color: Hsla },
+    /// The diagnostic headline: chevron, severity icon, `file:line`,
+    /// message, code — click opens the file, chevron toggles the snippet.
+    Item {
+        idx: usize,
+        icon: char,
+        color: Hsla,
+        location: Option<String>,
+        message: String,
+        code: Option<String>,
+        file: Option<String>,
+        expanded: bool,
+    },
+    /// One `whitespace_nowrap` line of the rustc-rendered snippet, boxed
+    /// with the severity-colored left border (the old per-diagnostic box,
+    /// line-per-row).
+    Snippet { color: Hsla, line: String },
+}
+
 pub struct DiagnosticsPanel {
     focus_handle: FocusHandle,
     state: Entity<StudioState>,
@@ -41,11 +76,16 @@ pub struct DiagnosticsPanel {
     /// a row click then opens the diagnostic's file. `new` leaves it off.
     bus: Option<WeakEntity<ViewerBus>>,
     /// Every diagnostic drained so far, append-only — indexes stay stable
-    /// and key the expansion set.
+    /// and key the expansion set. Cleared when a new build starts (the
+    /// observer below catches the run-state transition).
     diags: Vec<Diag>,
     show_errors: bool,
     show_warnings: bool,
     expanded: HashSet<usize>,
+    /// Last seen "the runner is building" marker: only the Idle/other →
+    /// Building transition resets the buffer, repeated Building frames
+    /// (the state pump notifies on every tick) are no-ops.
+    building_seen: bool,
 }
 
 impl DiagnosticsPanel {
@@ -59,13 +99,30 @@ impl DiagnosticsPanel {
     ) -> Self {
         let panel = Self {
             focus_handle: cx.focus_handle(),
-            state,
+            state: state.clone(),
             bus: bus.map(|bus| bus.downgrade()),
             diags: Vec::new(),
             show_errors: true,
             show_warnings: true,
             expanded: HashSet::new(),
+            building_seen: false,
         };
+        // A new build wipes the previous run's diagnostics: the first
+        // transition into `RunState::Building` (the state pump notifies on
+        // every tick, so observers see each run-state change) clears the
+        // buffer before the new build's output reaches the drain loop.
+        cx.observe(&state, |panel, state, cx| {
+            let run = state.read(cx).run_state.clone();
+            if reset_on_build_start(
+                &mut panel.diags,
+                &mut panel.expanded,
+                &mut panel.building_seen,
+                &run,
+            ) {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.spawn(async move |panel, cx| {
             loop {
                 cx.background_executor().timer(DRAIN_INTERVAL).await;
@@ -86,143 +143,119 @@ impl DiagnosticsPanel {
         panel
     }
 
-    /// One list row: chevron, severity icon, `file:line` and the message;
-    /// row click opens the file, chevron click expands the rendered snippet.
-    fn row(&self, idx: usize, panel: &WeakEntity<Self>, cx: &App) -> AnyElement {
+    /// Test seam (headless perf/behavior tests in `tests/ui.rs` mirror the
+    /// module tree, so the panel's private buffer needs a cfg(test) way in):
+    /// append already-parsed diagnostics as if drained from the sink.
+    #[cfg(test)]
+    pub fn push_for_test(&mut self, fresh: Vec<Diag>) {
+        self.diags.extend(fresh);
+    }
+
+    /// Test seam: expand/collapse one diagnostic (the chevron-click body —
+    /// click dispatch needs the kit's test-support, which this crate
+    /// deliberately does not enable).
+    #[cfg(test)]
+    pub fn set_expanded_for_test(&mut self, idx: usize, on: bool) {
+        if on {
+            self.expanded.insert(idx);
+        } else {
+            self.expanded.remove(&idx);
+        }
+    }
+
+    /// The visible rows: filter chips pick the severities (each rendered
+    /// section only when non-empty), expanded diagnostics contribute one row
+    /// per rendered snippet line. `uniform_list` lays out only the on-screen
+    /// range, so a 500-row build costs no more per frame than an empty one.
+    fn flatten(&self) -> Vec<DiagRow> {
+        let mut rows = Vec::new();
+        if self.show_errors {
+            let idxs: Vec<usize> = self
+                .diags
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.severity == DiagSeverity::Error)
+                .map(|(i, _)| i)
+                .collect();
+            if !idxs.is_empty() {
+                rows.push(DiagRow {
+                    kind: DiagRowKind::Section {
+                        text: format!("Ошибки — {}", idxs.len()),
+                        color: theme::RED,
+                    },
+                });
+                for i in idxs {
+                    self.push_diag_rows(i, &mut rows);
+                }
+            }
+        }
+        if self.show_warnings {
+            let idxs: Vec<usize> = self
+                .diags
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.severity != DiagSeverity::Error)
+                .map(|(i, _)| i)
+                .collect();
+            if !idxs.is_empty() {
+                rows.push(DiagRow {
+                    kind: DiagRowKind::Section {
+                        text: format!("Предупреждения и заметки — {}", idxs.len()),
+                        color: theme::YELLOW,
+                    },
+                });
+                for i in idxs {
+                    self.push_diag_rows(i, &mut rows);
+                }
+            }
+        }
+        rows
+    }
+
+    /// One diagnostic's rows: the headline, plus — when expanded — one row
+    /// per line of rustc's rendered snippet.
+    fn push_diag_rows(&self, idx: usize, rows: &mut Vec<DiagRow>) {
         let diag = &self.diags[idx];
-        let (icon, color) = match diag.severity {
-            DiagSeverity::Error => (fa::CIRCLE_EXCLAMATION, theme::RED),
-            DiagSeverity::Warning => (TRIANGLE_EXCLAMATION, theme::YELLOW),
-            DiagSeverity::Note => (TRIANGLE_EXCLAMATION, theme::MUTED),
-        };
-        let expanded = self.expanded.contains(&idx);
+        let (icon, color) = severity_icon(diag.severity);
         let location = match (&diag.file, diag.line) {
             (Some(file), Some(line)) => Some(format!("{file}:{line}")),
             (Some(file), None) => Some(file.clone()),
             _ => None,
         };
-
-        let chevron = div()
-            .id(("diag-toggle", idx))
-            .flex_none()
-            .cursor_pointer()
-            .child(chevron(expanded))
-            .on_click({
-                let panel = panel.clone();
-                move |_, _, cx| {
-                    cx.stop_propagation(); // not a file-open click
-                    if let Some(panel) = panel.upgrade() {
-                        panel.update(cx, |panel, cx| {
-                            if panel.expanded.contains(&idx) {
-                                panel.expanded.remove(&idx);
-                            } else {
-                                panel.expanded.insert(idx);
-                            }
-                            cx.notify();
-                        });
-                    }
+        let expanded = self.expanded.contains(&idx);
+        rows.push(DiagRow {
+            kind: DiagRowKind::Item {
+                idx,
+                icon,
+                color,
+                location,
+                message: diag.message.clone(),
+                code: diag.code.clone(),
+                file: diag.file.clone(),
+                expanded,
+            },
+        });
+        if expanded {
+            if let Some(rendered) = diag.rendered.as_deref() {
+                for line in rendered.lines() {
+                    rows.push(DiagRow {
+                        kind: DiagRowKind::Snippet {
+                            color,
+                            line: line.to_string(),
+                        },
+                    });
                 }
-            });
-
-        let open = h_flex()
-            .items_start()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::HOVER))
-            .child(chevron)
-            .child(div().flex_none().text_color(color).child(fa::icon(icon)))
-            .when_some(location, |row, location| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_sm()
-                        .text_color(theme::TEXT_DIM)
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .whitespace_nowrap()
-                        .child(location),
-                )
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_sm()
-                    .text_color(theme::TEXT)
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(diag.message.clone()),
-            )
-            .when_some(diag.code.clone(), |row, code| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme::FAINT)
-                        .whitespace_nowrap()
-                        .child(code),
-                )
-            });
-
-        // Row click → open through the bus (a no-op when not wired).
-        let row = div()
-            .id(("diag-row", idx))
-            .on_click({
-                let bus = self.bus.clone();
-                let state = self.state.clone();
-                let file = diag.file.clone();
-                move |_, _, cx| {
-                    let Some(path) = file
-                        .as_deref()
-                        .and_then(|file| resolve_file(file, state.read(cx)))
-                    else {
-                        return;
-                    };
-                    if let Some(bus) = bus.as_ref().and_then(|bus| bus.upgrade()) {
-                        bus.update(cx, |bus, cx| bus.open(path, cx));
-                    }
-                }
-            })
-            .child(open);
-
-        // rustc's rendered snippet, one `whitespace_nowrap` row per line
-        // (this gpui Div has no pre-wrap style; clipping keeps long lines
-        // from blowing out the dock width).
-        let rendered_lines: Vec<String> = if expanded {
-            diag.rendered
-                .as_deref()
-                .map(|r| r.lines().map(str::to_string).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut col = v_flex().child(row);
-        if !rendered_lines.is_empty() {
-            col =
-                col.child(
-                    div()
-                        .mx_2()
-                        .mb_1()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_sm()
-                        .bg(theme::CARD)
-                        .border_l_2()
-                        .border_color(color)
-                        .text_size(px(12.))
-                        .text_color(theme::TEXT_DIM)
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(v_flex().gap_0().children(
-                            rendered_lines.into_iter().map(|line| {
-                                div().overflow_hidden().whitespace_nowrap().child(line)
-                            }),
-                        )),
-                );
+            }
         }
-        col.into_any_element()
+    }
+}
+
+/// Severity icon + color (the old `row()` palette).
+fn severity_icon(severity: DiagSeverity) -> (char, Hsla) {
+    match severity {
+        DiagSeverity::Error => (fa::CIRCLE_EXCLAMATION, theme::RED),
+        DiagSeverity::Warning => (TRIANGLE_EXCLAMATION, theme::YELLOW),
+        DiagSeverity::Note => (TRIANGLE_EXCLAMATION, theme::MUTED),
     }
 }
 
@@ -261,18 +294,6 @@ fn resolve_file(file: &str, state: &StudioState) -> Option<PathBuf> {
     None
 }
 
-/// Small group heading above a severity section.
-fn section_label(text: String, color: Hsla) -> AnyElement {
-    div()
-        .px_2()
-        .pt_2()
-        .pb_1()
-        .text_xs()
-        .text_color(color)
-        .child(text)
-        .into_any_element()
-}
-
 impl EventEmitter<PanelEvent> for DiagnosticsPanel {}
 
 impl Focusable for DiagnosticsPanel {
@@ -295,21 +316,12 @@ impl Panel for DiagnosticsPanel {
 
 impl Render for DiagnosticsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let error_idx: Vec<usize> = self
+        let error_count = self
             .diags
             .iter()
-            .enumerate()
-            .filter(|(_, d)| d.severity == DiagSeverity::Error)
-            .map(|(i, _)| i)
-            .collect();
-        let warning_idx: Vec<usize> = self
-            .diags
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.severity != DiagSeverity::Error)
-            .map(|(i, _)| i)
-            .collect();
-        let (error_count, warning_count) = (error_idx.len(), warning_idx.len());
+            .filter(|d| d.severity == DiagSeverity::Error)
+            .count();
+        let warning_count = self.diags.len() - error_count;
 
         // Filter chips: active in the severity color, off in faint gray.
         let panel = cx.entity().downgrade();
@@ -357,28 +369,26 @@ impl Render for DiagnosticsPanel {
                 }
             });
 
+        // The virtualized row list: sections + headlines + expanded snippet
+        // lines, flattened once per render, laid out on-screen only.
+        let rows = Arc::new(self.flatten());
+        let empty = rows.is_empty();
         let panel_handle = cx.entity().downgrade();
-        let mut list = v_flex().gap_0p5();
-        let mut shown = 0usize;
-        if self.show_errors && error_count > 0 {
-            list = list.child(section_label(format!("Ошибки — {error_count}"), theme::RED));
-            for &i in &error_idx {
-                list = list.child(self.row(i, &panel_handle, cx));
-                shown += 1;
-            }
-        }
-        if self.show_warnings && warning_count > 0 {
-            list = list.child(section_label(
-                format!("Предупреждения и заметки — {warning_count}"),
-                theme::YELLOW,
-            ));
-            for &i in &warning_idx {
-                list = list.child(self.row(i, &panel_handle, cx));
-                shown += 1;
-            }
-        }
+        let bus = self.bus.clone();
+        let state = self.state.clone();
+        let list = uniform_list("diag-rows", rows.len().max(1), move |range, _, cx| {
+            range
+                .map(|ix| match rows.get(ix) {
+                    Some(row) => render_diag_row(row, &panel_handle, &bus, &state, cx),
+                    // Keeps the measured slot when the list is empty.
+                    None => div().h(px(DIAG_ROW_H)).into_any_element(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .flex_1()
+        .min_h_0();
 
-        let body = if shown == 0 {
+        let body = if empty {
             let (glyph_color, headline, hint) = if self.diags.is_empty() {
                 (
                     theme::GREEN,
@@ -407,13 +417,7 @@ impl Render for DiagnosticsPanel {
                 .child(div().text_xs().text_color(theme::FAINT).child(hint))
                 .into_any_element()
         } else {
-            div()
-                .id("diagnostics-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_scroll()
-                .child(div().p_2().child(list))
-                .into_any_element()
+            list.into_any_element()
         };
 
         v_flex()
@@ -431,5 +435,258 @@ impl Render for DiagnosticsPanel {
                     .child(warnings_chip),
             )
             .child(body)
+    }
+}
+
+/// Element for one visible row (only the on-screen range is built). Headline
+/// rows keep the old interaction shape — row click opens the file through
+/// the bus, chevron click toggles the snippet (propagation stopped so a
+/// chevron click never opens).
+fn render_diag_row(
+    row: &DiagRow,
+    panel: &WeakEntity<DiagnosticsPanel>,
+    bus: &Option<WeakEntity<ViewerBus>>,
+    state: &Entity<StudioState>,
+    cx: &App,
+) -> AnyElement {
+    match &row.kind {
+        DiagRowKind::Section { text, color } => div()
+            .h(px(DIAG_ROW_H))
+            .w_full()
+            .flex()
+            .items_center()
+            .px_2()
+            .text_xs()
+            .text_color(*color)
+            .child(text.clone())
+            .into_any_element(),
+        DiagRowKind::Item {
+            idx,
+            icon,
+            color,
+            location,
+            message,
+            code,
+            file,
+            expanded,
+        } => {
+            let idx = *idx;
+            let chevron = div()
+                .id(("diag-toggle", idx))
+                .flex_none()
+                .cursor_pointer()
+                .child(chevron(*expanded))
+                .on_click({
+                    let panel = panel.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation(); // not a file-open click
+                        if let Some(panel) = panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                if panel.expanded.contains(&idx) {
+                                    panel.expanded.remove(&idx);
+                                } else {
+                                    panel.expanded.insert(idx);
+                                }
+                                cx.notify();
+                            });
+                        }
+                    }
+                });
+
+            let line = h_flex()
+                .h(px(DIAG_ROW_H))
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::HOVER))
+                .child(chevron)
+                .child(div().flex_none().text_color(*color).child(fa::icon(*icon)))
+                .when_some(location.clone(), |row, location| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_sm()
+                            .text_color(theme::TEXT_DIM)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .whitespace_nowrap()
+                            .child(location),
+                    )
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_sm()
+                        .text_color(theme::TEXT)
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(message.clone()),
+                )
+                .when_some(code.clone(), |row, code| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::FAINT)
+                            .whitespace_nowrap()
+                            .child(code),
+                    )
+                });
+
+            // Row click → open through the bus (a no-op when not wired).
+            line.id(("diag-row", idx))
+                .on_click({
+                    let bus = bus.clone();
+                    let state = state.clone();
+                    let file = file.clone();
+                    move |_, _, cx| {
+                        let Some(path) = file
+                            .as_deref()
+                            .and_then(|file| resolve_file(file, state.read(cx)))
+                        else {
+                            return;
+                        };
+                        if let Some(bus) = bus.as_ref().and_then(|bus| bus.upgrade()) {
+                            bus.update(cx, |bus, cx| bus.open(path, cx));
+                        }
+                    }
+                })
+                .into_any_element()
+        }
+        // rustc's rendered snippet line: severity-colored left border over
+        // the CARD fill, clipped to one `whitespace_nowrap` line (this gpui
+        // Div has no pre-wrap style; clipping keeps long lines from blowing
+        // out the dock width).
+        DiagRowKind::Snippet { color, line } => div()
+            .h(px(DIAG_ROW_H))
+            .w_full()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .mx_2()
+                    .pl_2()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .bg(theme::CARD)
+                    .border_l_2()
+                    .border_color(*color)
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(12.))
+                            .text_color(theme::TEXT_DIM)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(line.clone()),
+                    ),
+            )
+            .into_any_element(),
+    }
+}
+
+/// The first transition into `RunState::Building` starts a new build: the
+/// accumulated diagnostics belong to the previous run and are wiped along
+/// with the expansions (indices restart with the new build). Repeat
+/// Building frames are no-ops; any other state (Running/Idle/Failed/
+/// Stopping) only clears the marker. Free function so the buffer rule is
+/// unit-testable without a gpui context; returns whether it cleared.
+fn reset_on_build_start(
+    diags: &mut Vec<Diag>,
+    expanded: &mut HashSet<usize>,
+    building_seen: &mut bool,
+    run_state: &RunState,
+) -> bool {
+    if matches!(run_state, RunState::Building) {
+        if *building_seen {
+            return false;
+        }
+        *building_seen = true;
+        diags.clear();
+        expanded.clear();
+        return true;
+    }
+    *building_seen = false;
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diag(severity: DiagSeverity, message: &str) -> Diag {
+        Diag {
+            severity,
+            message: message.to_string(),
+            rendered: None,
+            file: None,
+            line: None,
+            col: None,
+            code: None,
+        }
+    }
+
+    /// Two builds in a row: after the second start none of the first run's
+    /// diagnostics remain, and the new run's output survives repeat
+    /// Building frames (the state pump notifies on every tick).
+    // `gpui_kit::*` (test-support on) re-exports gpui's `test` proc macro,
+    // which shadows the builtin — spell the builtin out (same reason
+    // tests/ui.rs imports Kit types explicitly).
+    #[::core::prelude::v1::test]
+    fn reset_on_build_start_clears_previous_build() {
+        let mut diags = vec![
+            diag(DiagSeverity::Error, "old error"),
+            diag(DiagSeverity::Warning, "old warning"),
+        ];
+        let mut expanded = HashSet::from([0]);
+        let mut seen = false;
+
+        // First build start: reset + marker.
+        assert!(reset_on_build_start(
+            &mut diags,
+            &mut expanded,
+            &mut seen,
+            &RunState::Building
+        ));
+        assert!(diags.is_empty());
+        assert!(expanded.is_empty());
+        assert!(seen);
+
+        // The new build's diagnostics arrive and must survive further
+        // Building frames.
+        diags.push(diag(DiagSeverity::Error, "new error"));
+        expanded.insert(0);
+        assert!(!reset_on_build_start(
+            &mut diags,
+            &mut expanded,
+            &mut seen,
+            &RunState::Building
+        ));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "new error");
+
+        // The run finishes (marker clears), then a new build resets again.
+        assert!(!reset_on_build_start(
+            &mut diags,
+            &mut expanded,
+            &mut seen,
+            &RunState::Running
+        ));
+        assert!(!seen);
+        assert!(reset_on_build_start(
+            &mut diags,
+            &mut expanded,
+            &mut seen,
+            &RunState::Building
+        ));
+        assert!(diags.is_empty());
+        assert!(expanded.is_empty());
     }
 }

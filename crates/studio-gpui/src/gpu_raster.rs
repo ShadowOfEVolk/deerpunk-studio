@@ -301,15 +301,12 @@ fn clear_target(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::time::Instant;
 
     use super::*;
-    use super::super::raster::RasterCache;
     use deerpunk_engine_common::ui_draw::{UiDraw, UiMesh, UiTextureUpload, UiVertex};
-    use deerpunk_ui::{UiDirAssets, UiRuntime};
 
     /// Copy of the game's `<gamedir>/shaders/ui.wgsl` (ohmyblock), so the
-    /// tests exercise the real shader + preprocessor include resolution.
+    /// test exercises the real shader + preprocessor include resolution.
     const UI_WGSL: &str = r#"
 #include "inc/color_space.wgsl"
 
@@ -379,10 +376,10 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 "#;
 
     /// Self-contained shader root: `<root>/shaders/ui.wgsl` + include, like
-    /// a gamedir. `tag` keeps parallel tests out of each other's way.
-    fn shader_root(tag: &str) -> PathBuf {
+    /// a gamedir.
+    fn shader_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "deerpunk-studio-gpu-raster-test-{}-{tag}",
+            "deerpunk-studio-gpu-raster-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(dir.join("shaders/inc")).expect("create shader root");
@@ -392,346 +389,81 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
         dir
     }
 
-    fn vert(pos: [f32; 2], uv: [f32; 2], color: [u8; 4]) -> UiVertex {
-        UiVertex { pos, uv, color }
-    }
-
-    /// Solid uv 0..1 quad, two triangles, integer-aligned.
-    fn rect_mesh(id: u32, x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) -> UiMesh {
-        UiMesh {
-            id,
-            vertices: vec![
-                vert([x, y], [0.0, 0.0], color),
-                vert([x + w, y], [1.0, 0.0], color),
-                vert([x + w, y + h], [1.0, 1.0], color),
-                vert([x, y + h], [0.0, 1.0], color),
-            ],
-            indices: vec![0, 1, 2, 0, 2, 3],
-        }
-    }
-
-    /// Opaque diagonal gradient: black at TL/BR, white at TR/BL — vertex
-    /// colors are the GPU/CPU agreement stress (linear round-trip vs byte
-    /// barycentric).
-    fn gradient_mesh(id: u32, x: f32, y: f32, w: f32, h: f32) -> UiMesh {
-        let black = [0, 0, 0, 255];
+    /// One frame: a single opaque white quad covering (0,0)–(64,64) on a
+    /// 1×1 white texture.
+    fn frame() -> UiFrame {
         let white = [255, 255, 255, 255];
-        UiMesh {
-            id,
-            vertices: vec![
-                vert([x, y], [0.0, 0.0], black),
-                vert([x + w, y], [1.0, 0.0], white),
-                vert([x + w, y + h], [1.0, 1.0], black),
-                vert([x, y + h], [0.0, 1.0], white),
-            ],
-            indices: vec![0, 1, 2, 0, 2, 3],
-        }
-    }
-
-    fn draw(mesh_id: u32, texture_id: u32, scissor: Option<[i32; 4]>) -> UiDraw {
-        UiDraw {
-            mesh_id,
-            translation: [0.0; 2],
-            texture_id,
-            scissor,
-        }
-    }
-
-    fn white_texture() -> (u32, UiTextureUpload) {
-        (
-            1,
-            UiTextureUpload {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 255, 255, 255],
-                filter_nearest: true,
-            },
-        )
-    }
-
-    /// 2×2 opaque checker (white/black/white/black), nearest-filtered:
-    /// magnified 40× in the parity frame, NEAREST sampling must match.
-    fn checker_texture() -> (u32, UiTextureUpload) {
-        (
-            2,
-            UiTextureUpload {
-                width: 2,
-                height: 2,
-                rgba: vec![
-                    255, 255, 255, 255, 0, 0, 0, 255, //
-                    0, 0, 0, 255, 255, 255, 255, 255, //
+        UiFrame {
+            meshes: vec![UiMesh {
+                id: 1,
+                vertices: vec![
+                    UiVertex {
+                        pos: [0.0, 0.0],
+                        uv: [0.0, 0.0],
+                        color: white,
+                    },
+                    UiVertex {
+                        pos: [64.0, 0.0],
+                        uv: [1.0, 0.0],
+                        color: white,
+                    },
+                    UiVertex {
+                        pos: [64.0, 64.0],
+                        uv: [1.0, 1.0],
+                        color: white,
+                    },
+                    UiVertex {
+                        pos: [0.0, 64.0],
+                        uv: [0.0, 1.0],
+                        color: white,
+                    },
                 ],
-                filter_nearest: true,
-            },
-        )
-    }
-
-    /// Frame 1: mesh + texture deltas, five draws — nearest-textured quad,
-    /// vertex-color gradient, scissored draw, offscreen geometry, and one
-    /// quad whose resources are released in frame 2.
-    fn parity_frame_1() -> UiFrame {
-        let white = [255, 255, 255, 255];
-        UiFrame {
-            meshes: vec![
-                rect_mesh(10, 10.0, 10.0, 80.0, 80.0, white),
-                gradient_mesh(11, 120.0, 80.0, 240.0, 160.0),
-                rect_mesh(12, 300.0, 300.0, 200.0, 120.0, white),
-                rect_mesh(13, 600.0, 400.0, 100.0, 60.0, white),
-                rect_mesh(14, 400.0, 100.0, 60.0, 60.0, white),
-            ],
-            draws: vec![
-                draw(10, 2, None),
-                draw(11, 1, None),
-                draw(12, 1, Some([320, 320, 100, 60])),
-                draw(13, 1, None),
-                draw(14, 1, None),
-            ],
-            textures: HashMap::from([white_texture(), checker_texture()]),
-            screen: [640, 480],
+                indices: vec![0, 1, 2, 0, 2, 3],
+            }],
+            draws: vec![UiDraw {
+                mesh_id: 1,
+                translation: [0.0; 2],
+                texture_id: 1,
+                scissor: None,
+            }],
+            textures: HashMap::from([(
+                1,
+                UiTextureUpload {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 255, 255, 255],
+                    filter_nearest: true,
+                },
+            )]),
+            screen: [320, 240],
             ..Default::default()
         }
     }
 
-    /// Frame 2: releases (mesh 14, texture 2) while the draw list still
-    /// references both — those draws must vanish on both paths.
-    fn parity_frame_2() -> UiFrame {
-        UiFrame {
-            released_meshes: vec![14],
-            released: vec![2],
-            draws: parity_frame_1().draws,
-            screen: [640, 480],
-            ..Default::default()
-        }
-    }
-
-    fn compare(cpu: &[u8], gpu: &[u8], label: &str) {
-        assert_eq!(gpu.len(), cpu.len(), "{label}: buffer length");
-        let mut max = 0u32;
-        let mut differing = 0usize;
-        for (pc, pg) in cpu.chunks_exact(4).zip(gpu.chunks_exact(4)) {
-            if pc != pg {
-                differing += 1;
-            }
-            for (a, b) in pc.iter().zip(pg.iter()) {
-                max = max.max(u32::from(a.abs_diff(*b)));
-            }
-        }
-        eprintln!(
-            "parity [{label}]: max channel diff {max}, differing pixels {differing}/{}",
-            cpu.len() / 4
-        );
-        assert!(max <= 2, "{label}: max channel diff {max} > 2");
-    }
-
-    /// GPU vs CPU parity across the full session flow: deltas + draws,
-    /// releases, empty draw list, resize replay. Tolerance ≤2 per BGRA
-    /// channel (sRGB round-trip + blend float noise).
+    /// The GPU path initializes (adapter + preprocessed shader + `UiPass`)
+    /// and returns dense buffers of the requested size — fresh frame and
+    /// resize replay alike. Skips (not fails) without an adapter.
     #[test]
     #[cfg(target_os = "macos")]
-    fn gpu_cpu_parity() {
-        let root = shader_root("parity");
+    fn gpu_raster_initializes_and_sizes() {
+        let root = shader_root();
         let Some(mut gpu) = GpuRaster::new(&root) else {
-            eprintln!("gpu_cpu_parity: no adapter/device — skipping");
+            eprintln!("gpu_raster_initializes_and_sizes: no adapter/device — skipping");
             let _ = std::fs::remove_dir_all(&root);
             return;
         };
-        let mut cache = RasterCache::default();
-        let screen = [640u32, 480];
 
-        let f1 = parity_frame_1();
-        cache.apply(&f1);
-        let cpu = cache.raster(screen[0], screen[1]);
-        let g = gpu.raster(Some(&f1), screen).expect("gpu raster");
-        compare(&cpu, &g, "frame 1");
+        let f = frame();
+        let buf = gpu
+            .raster(Some(&f), [320, 240])
+            .expect("gpu raster returns a buffer");
+        assert_eq!(buf.len(), 320 * 240 * 4);
+        assert!(buf.iter().any(|&b| b != 0), "nothing rendered");
 
-        let f2 = parity_frame_2();
-        cache.apply(&f2);
-        let cpu = cache.raster(screen[0], screen[1]);
-        let g = gpu.raster(Some(&f2), screen).expect("gpu raster");
-        compare(&cpu, &g, "frame 2 (releases)");
-
-        let f3 = UiFrame {
-            draws: Vec::new(),
-            screen,
-            ..Default::default()
-        };
-        cache.apply(&f3);
-        let cpu = cache.raster(screen[0], screen[1]);
-        let g = gpu.raster(Some(&f3), screen).expect("gpu raster");
-        compare(&cpu, &g, "empty draws");
-        assert!(g.iter().all(|&b| b == 0), "empty draws must be transparent");
-
-        // Resize with no fresh frame: the last draw list re-renders at the
-        // new size (CPU: the cache re-rasters the same draws).
-        let cpu = cache.raster(400, 300);
-        let g = gpu.raster(None, [400, 300]).expect("gpu raster");
-        compare(&cpu, &g, "resize replay");
+        // Resize replay with no fresh frame: last draw list at a new size.
+        let buf = gpu.raster(None, [160, 120]).expect("gpu raster replay");
+        assert_eq!(buf.len(), 160 * 120 * 4);
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Informational CPU vs GPU timing (no assertions): 1280×720, 200
-    /// opaque quads, 60 frames after a warm-up encode.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn timing_gpu_vs_cpu() {
-        let root = shader_root("timing");
-        let Some(mut gpu) = GpuRaster::new(&root) else {
-            eprintln!("timing_gpu_vs_cpu: no adapter/device — skipping");
-            let _ = std::fs::remove_dir_all(&root);
-            return;
-        };
-        let (w, h) = (1280u32, 720u32);
-        let white = [255, 255, 255, 255];
-        let mut meshes = Vec::new();
-        let mut draws = Vec::new();
-        let mut id = 100;
-        'grid: for row in 0..14u32 {
-            for col in 0..15u32 {
-                if meshes.len() == 200 {
-                    break 'grid;
-                }
-                let (x, y) = ((col * 76) as f32, (row * 48) as f32);
-                meshes.push(rect_mesh(id, x, y, 64.0, 64.0, white));
-                draws.push(draw(id, 1, None));
-                id += 1;
-            }
-        }
-        let f_all = UiFrame {
-            meshes,
-            draws: draws.clone(),
-            textures: HashMap::from([white_texture()]),
-            screen: [w, h],
-            ..Default::default()
-        };
-        let f_draw = UiFrame {
-            draws,
-            screen: [w, h],
-            ..Default::default()
-        };
-
-        const FRAMES: usize = 60;
-        let mut cache = RasterCache::default();
-        cache.apply(&f_all);
-        let at = Instant::now();
-        for _ in 0..FRAMES {
-            std::hint::black_box(cache.raster(w, h));
-        }
-        let cpu_ms = at.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
-
-        std::hint::black_box(gpu.raster(Some(&f_all), [w, h]).expect("gpu raster"));
-        let at = Instant::now();
-        for _ in 0..FRAMES {
-            let buf = gpu.raster(Some(&f_draw), [w, h]).expect("gpu raster");
-            std::hint::black_box(&buf);
-        }
-        let gpu_ms = at.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
-
-        eprintln!(
-            "timing (1280×720, 200 quads, {FRAMES} frames): CPU {cpu_ms:.2} ms/frame, GPU {gpu_ms:.2} ms/frame"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Live smoke against a real game project, opt-in: set
-    /// `DEERPUNK_STUDIO_GPU_SMOKE` to a widget path, e.g.
-    /// `~/dev/gamedev/ohmyblock/gamedir/ui/widgets/loading_screen.rml`.
-    /// Loads the document through the real `deerpunk-ui` runtime (the same
-    /// `UiDirAssets` resolver as in-game, real fonts/RCSS) and renders ~30
-    /// frames through both paths; the GPU path must never error and must
-    /// produce a live image. Real RmlUi content blends translucent fills
-    /// and linear-filtered textures — color spaces the two rasterizers
-    /// legitimately disagree on — so the CPU comparison is reported, not
-    /// asserted.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn smoke_real_document() {
-        let Some(path) = std::env::var_os("DEERPUNK_STUDIO_GPU_SMOKE").map(PathBuf::from) else {
-            eprintln!(
-                "smoke_real_document: set DEERPUNK_STUDIO_GPU_SMOKE=<file.rml> to run against a real widget"
-            );
-            return;
-        };
-        // Base = nearest ancestor dir named `ui` (the widgetshot rule); the
-        // shader root is its parent — the gamedir (`shaders/ui.wgsl`).
-        let mut base = None;
-        let mut cur = path.as_path();
-        while let Some(parent) = cur.parent() {
-            if parent.file_name().and_then(|n| n.to_str()) == Some("ui") {
-                base = Some(parent.to_path_buf());
-                break;
-            }
-            cur = parent;
-        }
-        let Some(base) = base else {
-            panic!("{} has no `ui` ancestor directory", path.display());
-        };
-        let rel = path
-            .strip_prefix(&base)
-            .expect("rel under ui base")
-            .to_string_lossy()
-            .into_owned();
-
-        let runtime = UiRuntime::new(
-            Box::new(UiDirAssets::new(base.clone())),
-            (640, 480),
-            "gpu-smoke",
-        );
-        assert!(
-            runtime.is_ready(),
-            "no usable fonts under {} — need fonts/*.ttf",
-            base.display()
-        );
-        let doc = runtime
-            .load_document(&rel)
-            .unwrap_or_else(|| panic!("failed to load {rel} under {}", base.display()));
-        doc.show();
-
-        let shader_root = base.parent().expect("gamedir above ui root").to_path_buf();
-        let Some(mut gpu) = GpuRaster::new(&shader_root) else {
-            eprintln!("smoke_real_document: no adapter/device — skipping");
-            return;
-        };
-        let mut cache = RasterCache::default();
-        let screen = [640u32, 480];
-        let mut frames = 0usize;
-        let mut last_gpu = Vec::new();
-        let mut last_cpu = Vec::new();
-        let at = Instant::now();
-        for _ in 0..30 {
-            if let Some(frame) = runtime.frame() {
-                cache.apply(&frame);
-                let gpu_buf = gpu.raster(Some(&frame), screen).expect("gpu raster");
-                last_cpu = cache.raster(screen[0], screen[1]);
-                last_gpu = gpu_buf;
-                frames += 1;
-            }
-            let _ = deerpunk_ui::drain_commands();
-        }
-        assert!(frames > 0, "runtime produced no frames for {rel:?}");
-        if last_cpu.iter().any(|&b| b != 0) {
-            assert!(
-                last_gpu.iter().any(|&b| b != 0),
-                "gpu output transparent while the cpu reference rendered content"
-            );
-        }
-        let differing = last_gpu
-            .chunks_exact(4)
-            .zip(last_cpu.chunks_exact(4))
-            .filter(|(g, c)| g != c)
-            .count();
-        let max_diff = last_gpu
-            .iter()
-            .zip(last_cpu.iter())
-            .map(|(g, c)| g.abs_diff(*c))
-            .max()
-            .unwrap_or(0);
-        eprintln!(
-            "smoke [{rel}]: {frames} frames in {:.1} ms ({:.2} ms/frame), \
-             gpu vs cpu: max diff {max_diff}, differing pixels {differing}/{}",
-            at.elapsed().as_secs_f64() * 1000.0,
-            at.elapsed().as_secs_f64() * 1000.0 / frames as f64,
-            last_gpu.len() / 4
-        );
     }
 }

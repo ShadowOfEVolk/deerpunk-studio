@@ -14,10 +14,12 @@
 
 use std::sync::Arc;
 
+use deerpunk_studio::runner::RunState;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
 use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::component::{Sizable, Size, h_flex, v_flex};
@@ -73,6 +75,12 @@ pub struct PuffinPanel {
 
     /// `puffin_http` client; dropping it stops its receiver thread.
     client: Option<puffin_http::Client>,
+    /// Run-state tracking for auto-connect: one attempt per engine run; a
+    /// manual Disconnect suppresses further attempts until the next run
+    /// starts (a manual Connect re-arms them).
+    last_run_state: Option<RunState>,
+    auto_connect_done: bool,
+    manual_disconnect: bool,
     view: View,
     /// Frozen selection (vendor `Paused`); `None` = live latest frames.
     paused: Option<Arc<Snapshot>>,
@@ -102,7 +110,8 @@ pub struct PuffinPanel {
 
 impl PuffinPanel {
     pub fn new(state: Entity<StudioState>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&state, |this, state, cx| this.observe_state(&state, cx))
+            .detach();
         Self {
             focus_handle: cx.focus_handle(),
             state,
@@ -110,6 +119,9 @@ impl PuffinPanel {
             filter_input: None,
             table: None,
             client: None,
+            last_run_state: None,
+            auto_connect_done: false,
+            manual_disconnect: false,
             view: View::Flamegraph,
             paused: None,
             snapshot: None,
@@ -188,6 +200,32 @@ impl PuffinPanel {
     }
 
     // -- data --------------------------------------------------------------
+
+    /// Auto-connect hook on `StudioState` changes: when the engine enters
+    /// [`RunState::Running`] and no client exists, create one `puffin_http`
+    /// client — it retries on its own thread until the game's server accepts
+    /// (so one attempt per run is enough). A manual Disconnect is respected
+    /// for the rest of the run; a fresh run re-arms the attempt and a manual
+    /// Connect re-enables automation.
+    fn observe_state(&mut self, state: &Entity<StudioState>, cx: &mut Context<Self>) {
+        let run_state = state.read(cx).run_state.clone();
+        let prev = self.last_run_state.replace(run_state.clone());
+        if run_state == RunState::Running && prev.as_ref() != Some(&run_state) {
+            self.auto_connect_done = false;
+            self.manual_disconnect = false;
+        }
+        if run_state == RunState::Running
+            && !self.auto_connect_done
+            && self.client.is_none()
+            && !self.manual_disconnect
+        {
+            self.auto_connect_done = true;
+            let addr = self.addr(cx);
+            self.connect(addr, cx);
+            return; // connect() already notified
+        }
+        cx.notify();
+    }
 
     /// Active selection: paused snapshot wins over the live one.
     fn active(&self) -> Option<Arc<Snapshot>> {
@@ -300,8 +338,19 @@ impl PuffinPanel {
 
     // -- toolbar actions -----------------------------------------------------
 
+    /// Copy the flamegraph of all visible threads as indented text.
+    fn copy_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.active() else {
+            return;
+        };
+        let opts = self.flame.clone();
+        let text = puffin_flame::frame_trace_text(&snapshot.selected, &opts, &snapshot.collection);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     fn connect(&mut self, addr: String, cx: &mut Context<Self>) {
         self.client = Some(puffin_http::Client::new(addr));
+        self.manual_disconnect = false;
         self.paused = None;
         self.snapshot = None;
         self.layout = None;
@@ -312,6 +361,8 @@ impl PuffinPanel {
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        // A manual disconnect wins over auto-connect until the next run.
+        self.manual_disconnect = true;
         self.paused = None;
         self.snapshot = None;
         self.layout = None;
@@ -378,7 +429,9 @@ impl PuffinPanel {
         }
         let center = center_px.unwrap_or(width_px / 2.0);
         let f = factor.clamp(0.05, 20.0);
-        self.flame.canvas_width_ns /= f;
+        // Keep the canvas range sane: 1 ns resolution floor, and zooming out
+        // past the session scale is pointless (the timeline grid degenerates).
+        self.flame.canvas_width_ns = (self.flame.canvas_width_ns / f).clamp(1.0, 1e12);
         self.flame.sideways_pan_px = (self.flame.sideways_pan_px - center) * f as f32 + center;
         cx.notify();
     }
@@ -502,8 +555,12 @@ impl PuffinPanel {
     // -- flame canvas ----------------------------------------------------------
 
     /// The scrollable flamegraph: a `canvas` element of the layout's content
-    /// height inside a vertical-scroll container that owns the mouse
-    /// listeners (vendor canvas interactions).
+    /// height inside a vertical-scroll container. The canvas itself is
+    /// wrapped in an inner div that owns wheel/pinch handling: its bubble
+    /// listeners run before the scroll container's internal handler, so the
+    /// canvas can claim the wheel for zoom/pan (`on_canvas_scroll` stops
+    /// propagation). The container keeps the mouse/click listeners and the
+    /// right-click copy menu (vendor canvas interactions).
     fn flame_area(
         &self,
         snapshot: Arc<Snapshot>,
@@ -523,26 +580,6 @@ impl PuffinPanel {
             .min_w_0()
             .overflow_y_scroll()
             .overflow_x_hidden()
-            .child(
-                canvas(|_, _, _| {}, {
-                    let snapshot = snapshot.clone();
-                    let layout = layout.clone();
-                    let opts = opts.clone();
-                    let panel = panel.clone();
-                    move |bounds, _, window, cx| {
-                        // Remember where the canvas lives for hit-testing next
-                        // frame; no notify (paint-phase mutation only).
-                        let _ = panel.update(cx, |this, _| {
-                            this.flame_bounds = bounds;
-                        });
-                        paint_flamegraph(
-                            &bounds, &snapshot, &layout, &opts, mouse, hovered, window, cx,
-                        );
-                    }
-                })
-                .h(content_height)
-                .w_full(),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.drag_accum = 0.),
@@ -550,7 +587,6 @@ impl PuffinPanel {
             .on_mouse_move(
                 cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.on_canvas_mouse_move(ev, cx)),
             )
-            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| this.on_canvas_scroll(ev, cx)))
             .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| this.on_canvas_click(ev, cx)))
             .on_hover({
                 let panel = panel.clone();
@@ -564,6 +600,46 @@ impl PuffinPanel {
                         });
                     }
                 }
+            })
+            .child(
+                div()
+                    .id("puffin-flame-canvas")
+                    .h(content_height)
+                    .w_full()
+                    .on_scroll(
+                        cx.listener(|this, ev: &ScrollEvent, _, cx| this.on_canvas_scroll(ev, cx)),
+                    )
+                    .on_pinch(
+                        cx.listener(|this, ev: &PinchEvent, _, cx| this.on_canvas_pinch(ev, cx)),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            {
+                                let snapshot = snapshot.clone();
+                                let layout = layout.clone();
+                                let opts = opts.clone();
+                                let panel = panel.clone();
+                                move |bounds, _, window, cx| {
+                                    // Remember where the canvas lives for hit-testing next
+                                    // frame; no notify (paint-phase mutation only).
+                                    let _ = panel.update(cx, |this, _| {
+                                        this.flame_bounds = bounds;
+                                    });
+                                    paint_flamegraph(
+                                        &bounds, &snapshot, &layout, &opts, mouse, hovered, window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .h_full()
+                        .w_full(),
+                    ),
+            )
+            .context_menu({
+                let panel = panel.clone();
+                move |menu, _, cx| flame_context_menu(&panel, menu, cx)
             })
             .into_any_element()
     }
@@ -622,6 +698,10 @@ impl PuffinPanel {
         cx.notify();
     }
 
+    /// Wheel over the canvas: delta Y zooms anchored at the ns under the
+    /// cursor; shift+wheel and the horizontal delta pan sideways in pixels.
+    /// The canvas owns the wheel — stop propagation so the vertical scroll
+    /// container (inner div bubble handlers run first) does not also scroll.
     fn on_canvas_scroll(&mut self, ev: &ScrollEvent, cx: &mut Context<Self>) {
         if !self.flame_bounds.contains(&ev.position) {
             return;
@@ -630,16 +710,35 @@ impl PuffinPanel {
             ScrollDelta::Pixels(d) => (d.x.as_f32(), d.y.as_f32()),
             ScrollDelta::Lines(d) => (d.x * 16., d.y * 16.),
         };
-        let zooming = ev.modifiers.control || ev.modifiers.platform;
-        if zooming {
-            // vendor: ctrl/cmd + scroll zooms around the mouse
-            let factor = (-dy * 0.01).exp().clamp(0.5, 2.0);
-            let center = ev.position.x.as_f32() - self.flame_bounds.origin.x.as_f32();
-            self.zoom(factor as f64, Some(center), cx);
-        } else {
-            self.flame.sideways_pan_px += dx;
+        if ev.modifiers.shift {
+            self.flame.sideways_pan_px += dx + dy;
             cx.notify();
+        } else {
+            if dx != 0.0 {
+                self.flame.sideways_pan_px += dx;
+            }
+            if dy != 0.0 {
+                // vendor zoom math: anchor at the cursor's canvas x.
+                let factor = (-dy * 0.01).exp().clamp(0.5, 2.0);
+                let center = ev.position.x.as_f32() - self.flame_bounds.origin.x.as_f32();
+                self.zoom(factor as f64, Some(center), cx);
+                return; // zoom() notified
+            }
+            if dx != 0.0 {
+                cx.notify();
+            }
         }
+        cx.stop_propagation();
+    }
+
+    /// Trackpad pinch: same anchor-at-cursor zoom as the wheel.
+    fn on_canvas_pinch(&mut self, ev: &PinchEvent, cx: &mut Context<Self>) {
+        if !self.flame_bounds.contains(&ev.position) {
+            return;
+        }
+        let factor = (1.0 + ev.delta).clamp(0.5, 2.0);
+        let center = ev.position.x.as_f32() - self.flame_bounds.origin.x.as_f32();
+        self.zoom(factor as f64, Some(center), cx);
     }
 
     fn on_canvas_click(&mut self, ev: &ClickEvent, cx: &mut Context<Self>) {
@@ -777,7 +876,8 @@ impl Render for PuffinPanel {
         // Connection row -------------------------------------------------
         let connect_button = match self.client {
             None => Button::new("puffin-connect")
-                .label(format!("{} Connect", fa::icon(fa::PLUG)))
+                .child(fa::sized(fa::PLUG, px(12.)))
+                .child("Connect")
                 .on_click({
                     let panel = panel.clone();
                     move |_, _, cx| {
@@ -790,7 +890,8 @@ impl Render for PuffinPanel {
                     }
                 }),
             Some(_) => Button::new("puffin-disconnect")
-                .label(format!("{} Disconnect", fa::icon(fa::PLUG_CIRCLE_XMARK)))
+                .child(fa::sized(fa::PLUG_CIRCLE_XMARK, px(12.)))
+                .child("Disconnect")
                 .on_click({
                     let panel = panel.clone();
                     move |_, _, cx| {
@@ -807,7 +908,8 @@ impl Render for PuffinPanel {
             .gap_1()
             .child(
                 Button::new("puffin-view-flame")
-                    .label(format!("{} Flamegraph", fa::icon(fa::FLAME)))
+                    .child(fa::sized(fa::FLAME, px(12.)))
+                    .child("Flamegraph")
                     .when(is_flamegraph, |b| b.custom(active_variant()))
                     .on_click({
                         let panel = panel.clone();
@@ -820,7 +922,8 @@ impl Render for PuffinPanel {
             )
             .child(
                 Button::new("puffin-view-stats")
-                    .label(format!("{} Table", fa::icon(fa::DATABASE)))
+                    .child(fa::sized(fa::DATABASE, px(12.)))
+                    .child("Table")
                     .when(!is_flamegraph, |b| b.custom(active_variant()))
                     .on_click({
                         let panel = panel.clone();
@@ -884,7 +987,7 @@ impl Render for PuffinPanel {
             }))
             .child(
                 Button::new("puffin-zoom-reset")
-                    .label(format!("{}", fa::icon(fa::ROTATE)))
+                    .child(fa::sized(fa::ROTATE, px(12.)))
                     .tooltip("Reset zoom (vendor: double-click)")
                     .on_click({
                         let panel = panel.clone();
@@ -897,17 +1000,27 @@ impl Render for PuffinPanel {
             );
 
         let pause_button = Button::new("puffin-pause")
-            .label(if paused {
-                format!("{} Resume", fa::icon(fa::PLAY))
-            } else {
-                format!("{} Pause", fa::icon(fa::STOP))
-            })
+            .when(paused, |b| b.child(fa::sized(fa::PLAY, px(12.))).child("Resume"))
+            .when(!paused, |b| b.child(fa::sized(fa::STOP, px(12.))).child("Pause"))
             .tooltip("Freeze the current frame selection (vendor: space)")
             .on_click({
                 let panel = panel.clone();
                 move |_, _, cx| {
                     if let Some(panel) = panel.upgrade() {
                         panel.update(cx, |this, cx| this.toggle_pause(cx));
+                    }
+                }
+            });
+
+        let copy_frame_button = Button::new("puffin-copy-frame")
+            .child(fa::sized(fa::COPY, px(12.)))
+            .child("Copy frame")
+            .tooltip("Copy the flamegraph of all visible threads as indented text")
+            .on_click({
+                let panel = panel.clone();
+                move |_, _, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |this, cx| this.copy_frame(cx));
                     }
                 }
             });
@@ -981,7 +1094,13 @@ impl Render for PuffinPanel {
                         .child(info)
                         .when_some(warning, |row, warning| {
                             row.child(div().text_color(theme::YELLOW).child(warning))
-                        }),
+                        })
+                        .child(
+                            div().text_color(theme::FAINT).child(
+                                "right-click: copy trace · wheel: zoom · \
+                                 drag / shift-wheel: pan · double-click: reset",
+                            ),
+                        ),
                 )
                 .child(self.flame_area(snapshot.clone(), layout.clone(), cx))
                 .into_any_element()
@@ -1049,6 +1168,7 @@ impl Render for PuffinPanel {
                     )
                     .child(zoom_buttons)
                     .child(pause_button)
+                    .child(copy_frame_button)
                     .child(frames_stepper),
             )
             .child(body)
@@ -1058,6 +1178,65 @@ impl Render for PuffinPanel {
 // ---------------------------------------------------------------------------
 // Flamegraph painting (vendor flamegraph.rs paint_* port)
 // ---------------------------------------------------------------------------
+
+/// Right-click menu on the flamegraph, built at open time from what is under
+/// the cursor: a hovered scope offers its span/thread trace; anything offers
+/// the whole-frame copy. Snapshots the text immediately so the menu content
+/// matches what the user pointed at.
+fn flame_context_menu(
+    panel: &WeakEntity<PuffinPanel>,
+    menu: PopupMenu,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(panel) = panel.upgrade() else {
+        return menu;
+    };
+    let this = panel.read(cx);
+    let opts = this.flame.clone();
+    let snapshot = this.active();
+    let layout = this.layout.clone();
+    let mouse = this.canvas_mouse();
+    let hovered = this.hovered();
+    let thread_label = mouse
+        .as_ref()
+        .and_then(|m| layout.as_ref()?.hit_thread_label((m.x.as_f32(), m.y.as_f32())));
+
+    let mut menu = menu;
+    if let (Some(snapshot), Some(layout)) = (&snapshot, &layout) {
+        let sel = &snapshot.selected;
+        let collection = &snapshot.collection;
+
+        if let Some(entry) = hovered.and_then(|ix| layout.scopes.get(ix))
+            && let Some(text) = puffin_flame::span_trace_text(sel, &opts, collection, entry)
+        {
+            menu = menu.item(
+                PopupMenuItem::new("Copy span trace").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }),
+            );
+        }
+
+        let thread_ix = thread_label
+            .or_else(|| hovered.and_then(|ix| layout.scopes.get(ix).map(|e| e.thread_ix)));
+        if let Some(thread_ix) = thread_ix
+            && let Some(text) = puffin_flame::thread_trace_text(sel, &opts, collection, thread_ix)
+        {
+            menu = menu.item(
+                PopupMenuItem::new("Copy thread trace").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }),
+            );
+        }
+
+        let text = puffin_flame::frame_trace_text(sel, &opts, collection);
+        menu = menu.item(
+            PopupMenuItem::new("Copy frame (all threads)").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }),
+        );
+    }
+    menu
+}
 
 #[allow(clippy::too_many_arguments)]
 fn paint_flamegraph(
