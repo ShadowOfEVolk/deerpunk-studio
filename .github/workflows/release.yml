@@ -71,6 +71,16 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libwayland-dev \
             libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev
 
+      # One cache per target, shared across tags: the default key folds in
+      # the git ref, which would cold-start every new release. The Cargo.lock
+      # hash as `key` still splits entries when dependencies move; a
+      # moved-ahead engine simply fails its fingerprint check and rebuilds.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.art }}
+          key: ${{ hashFiles('Cargo.lock') }}
+
       - name: Build release binaries
         run: cargo build --release --verbose -p studio-gpui -p deerpunk-mcp
 

@@ -40,6 +40,14 @@ jobs:
     - name: Symlink engine checkout where the [patch] expects it
       run: ln -s "$GITHUB_WORKSPACE/deerpunk" "$GITHUB_WORKSPACE/../deerpunk"
 
+    # Cache ~/.cargo + target/ (registry, git deps, compiled crates including
+    # the patched engine checkout's C artifacts, which land in the same
+    # target/). The auto key already folds in rustc version + Cargo.lock +
+    # Cargo.toml checksums; a moved-ahead engine just fails its fingerprint
+    # check and rebuilds those crates — correctness is cargo's, speed is ours.
+    - name: Cache cargo build
+      uses: Swatinem/rust-cache@v2
+
     - name: Build
       run: cargo build --workspace --verbose
     - name: Run tests
