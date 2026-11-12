@@ -403,6 +403,17 @@ fn render_diagnostics_list() {
             .expect("open headless diagnostics window")
         });
 
+    // Empty-state frame: the centered check glyph is a noop text glyph and
+    // rasterizes to nothing, so this is essentially uniform PANEL. Captured
+    // before any diagnostic is pushed; the render assertion below diffs
+    // against it.
+    cx.update_window(window, |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .expect("render empty diagnostics frame");
+    let shot_empty = cx.capture_screenshot(window).expect("capture empty frame");
+
     // 200 diagnostics (10:1 warnings:errors), two of the leading ones
     // expanded so their snippet boxes rasterize (text and font icons are
     // noop glyphs under NoopTextSystem).
@@ -450,17 +461,16 @@ fn render_diagnostics_list() {
     let shot_open = cx.capture_screenshot(window).expect("capture open frame");
 
     // List body painted: snippet CARD fills + severity-colored borders, not
-    // just the empty state's centered check glyph.
-    let mut colors = HashSet::new();
-    for y in 40..shot_open.height() - 20 {
-        for x in 10..shot_open.width() - 10 {
-            colors.insert(shot_open.get_pixel(x, y).0);
-        }
-    }
+    // just the empty state's centered check glyph. Keyed on pixels changed
+    // vs the empty frame rather than on a distinct-color count — AA blend
+    // shades quantize differently between the platform headless renderers
+    // (Metal on macOS, WGPU on Linux), so a fixed color-count threshold is
+    // renderer-tuned and breaks across platforms. Real content diffs in the
+    // hundreds of thousands of pixels; chevrons alone are ~3k.
+    let diff = diff_pixels(&shot_empty, &shot_open);
     assert!(
-        colors.len() >= 16,
-        "diagnostics body is nearly uniform ({} colors): the 200-row list did not render",
-        colors.len()
+        diff > 10_000,
+        "diagnostics body changed only {diff} pixels vs the empty state: the 200-row list did not render",
     );
 
     // Collapse the second expanded diagnostic (its snippet sits inside the
