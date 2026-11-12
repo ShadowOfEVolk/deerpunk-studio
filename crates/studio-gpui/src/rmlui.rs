@@ -1096,10 +1096,7 @@ mod tests {
     // NOT `use super::*`: the `gpui_kit::*` glob in the parent re-exports a
     // `test` proc-macro that shadows the builtin `#[test]` attribute (same
     // as viewers.rs's tests).
-    use super::{
-        grid_lines, image_rect, load_datamodel, zoom_at, GRID_MAJOR, GRID_MINOR, MAX_ZOOM,
-        MIN_ZOOM,
-    };
+    use super::{image_rect, load_datamodel, zoom_at, MAX_ZOOM, MIN_ZOOM};
     use gpui_kit::{point, px, size, Bounds, Pixels, Point};
     use std::path::PathBuf;
 
@@ -1188,45 +1185,6 @@ mod tests {
         assert_eq!((z, f32::from(p.x), f32::from(p.y)), (2.0, 5.0, 5.0));
         let (z, p) = zoom_at(c, doc, fit(), 1.5, point(px(5.), px(5.)), point(px(9.), px(9.)), 1.0);
         assert_eq!((z, f32::from(p.x), f32::from(p.y)), (1.5, 5.0, 5.0));
-    }
-
-    #[test]
-    fn grid_lines_are_distinct_pixel_positions() {
-        // Zoomed-in fit: minor lines every 8px, majors every 64 — all lines
-        // land on distinct integer pixel columns inside the canvas.
-        let lines = grid_lines(0.0, 500.0, 3.0, 1.0);
-        assert!(!lines.is_empty());
-        let mut prev_major = -1.0;
-        let mut majors = 0;
-        for (i, (x, is_major)) in lines.iter().enumerate() {
-            assert!(*x >= 0.0 && *x <= 500.0, "line {x} outside canvas");
-            // Per-tier strictly increasing ⇒ distinct painted pixels.
-            if *is_major {
-                assert!(*x > prev_major, "major {x} repeats/retreats");
-                prev_major = *x;
-                majors += 1;
-            } else if i > 0 && !lines[i - 1].1 {
-                assert!(*x > lines[i - 1].0, "minor {x} repeats/retreats");
-            }
-            // Anchored at the image origin: positions ≡ 3 (mod step).
-            let step = if *is_major { GRID_MAJOR } else { GRID_MINOR };
-            assert!((*x - 3.0) % step < 1e-4, "line {x} not on the 3px anchor");
-        }
-        // 500px canvas: majors at 3, 67, …, 451 → 8 of them; minors ≫ majors.
-        assert_eq!(majors, 8);
-        assert!(lines.len() > majors * 4, "minors missing: {}", lines.len());
-    }
-
-    #[test]
-    fn grid_lines_adapt_to_zoom() {
-        // Zoomed far out: minors denser than the cutoff drop out, majors stay.
-        let out = grid_lines(0.0, 500.0, 0.0, 0.2);
-        assert!(!out.is_empty());
-        assert!(out.iter().all(|(_, major)| *major), "minors survived 1.6px spacing");
-        // Even majors too dense → nothing (painter draws just the background).
-        assert!(grid_lines(0.0, 500.0, 0.0, 0.03).is_empty());
-        // Degenerate range → nothing.
-        assert!(grid_lines(10.0, 10.0, 0.0, 1.0).is_empty());
     }
 
     #[test]

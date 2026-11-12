@@ -77,14 +77,6 @@ impl RasterCache {
     }
 }
 
-/// Rasterize one self-contained [`UiFrame`] (inline texture/mesh deltas
-/// included) into a `w×h` BGRA8 (straight-alpha) buffer.
-pub fn raster_frame(frame: &UiFrame, w: u32, h: u32) -> Vec<u8> {
-    let mut cache = RasterCache::default();
-    cache.apply(frame);
-    cache.raster(w, h)
-}
-
 /// Paint every draw in order (painter's algorithm), calling `px(pixel_index,
 /// fragment)` for each covered pixel. Draws with unknown mesh/texture or an
 /// empty scissor are skipped — same skip rules as the egui painter.
@@ -222,60 +214,3 @@ fn raster_tri(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use deerpunk_engine_common::ui_draw::UiMesh;
-
-    /// One frame: a single white triangle covering (0,0)–(16,16) (hypotenuse
-    /// x + y = 16), painted over a transparent-black 16×16 target.
-    fn white_triangle_frame() -> UiFrame {
-        let vert = |pos: [f32; 2]| UiVertex {
-            pos,
-            uv: [0.5, 0.5],
-            color: [255, 255, 255, 255],
-        };
-        UiFrame {
-            meshes: vec![UiMesh {
-                id: 1,
-                vertices: vec![vert([0.0, 0.0]), vert([16.0, 0.0]), vert([0.0, 16.0])],
-                indices: vec![0, 1, 2],
-            }],
-            textures: HashMap::from([(
-                1,
-                UiTextureUpload {
-                    width: 2,
-                    height: 2,
-                    rgba: vec![255; 2 * 2 * 4],
-                    filter_nearest: true,
-                },
-            )]),
-            draws: vec![UiDraw {
-                mesh_id: 1,
-                translation: [0.0; 2],
-                texture_id: 1,
-                scissor: None,
-            }],
-            screen: [16, 16],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn white_triangle_on_black() {
-        let buf = raster_frame(&white_triangle_frame(), 16, 16);
-        assert_eq!(buf.len(), 16 * 16 * 4);
-        let px = |x: usize, y: usize| -> [u8; 4] {
-            buf[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4]
-                .try_into()
-                .unwrap()
-        };
-        // Fully covered interior: opaque white in BGRA byte order.
-        assert_eq!(px(4, 4), [255, 255, 255, 255]);
-        // Just inside the top/left edges (top-left fill rule).
-        assert_eq!(px(1, 1), [255, 255, 255, 255]);
-        // Across the hypotenuse x + y = 16: transparent black.
-        assert_eq!(px(8, 8), [0, 0, 0, 0]);
-        assert_eq!(px(15, 15), [0, 0, 0, 0]);
-    }
-}
