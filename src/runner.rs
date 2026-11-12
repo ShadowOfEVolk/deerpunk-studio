@@ -568,7 +568,7 @@ fn pump_build(cmd: &mut Command, cmd_rx: &Receiver<Cmd>, ev: &Sender<Event>) -> 
                     if !stopped {
                         stopped = true;
                         let _ = ev.send(Event::State(RunState::Stopping));
-                        signal_build(&mut child, libc::SIGTERM);
+                        signal_build(&mut child, StopSig::Term);
                         stop_deadline = Some(Instant::now() + Duration::from_secs(3));
                     }
                 }
@@ -579,7 +579,7 @@ fn pump_build(cmd: &mut Command, cmd_rx: &Receiver<Cmd>, ev: &Sender<Event>) -> 
         }
         if let Some(deadline) = stop_deadline {
             if Instant::now() >= deadline {
-                signal_build(&mut child, libc::SIGKILL);
+                signal_build(&mut child, StopSig::Kill);
                 stop_deadline = None;
             }
         }
@@ -678,12 +678,23 @@ fn feed_json_lines(buf: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
+/// Stop ladder for a build: soft first, hard on deadline.
+#[derive(Clone, Copy)]
+enum StopSig {
+    Term,
+    Kill,
+}
+
 /// Signal cargo's process group (spawned via `process_group(0)`); on
 /// platforms without group control, kill the direct child.
-fn signal_build(child: &mut Child, sig: i32) {
+fn signal_build(child: &mut Child, sig: StopSig) {
     #[cfg(unix)]
     {
-        let _ = unsafe { libc::kill(-(child.id() as i32), sig) };
+        let raw = match sig {
+            StopSig::Term => libc::SIGTERM,
+            StopSig::Kill => libc::SIGKILL,
+        };
+        let _ = unsafe { libc::kill(-(child.id() as i32), raw) };
     }
     #[cfg(not(unix))]
     {

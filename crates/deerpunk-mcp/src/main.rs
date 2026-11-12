@@ -66,9 +66,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// True while `pid` is an existing process. `kill(pid, 0)` performs the
-/// existence check without signalling; EPERM still means "exists" (someone
-/// else's process).
+/// True while `pid` is an existing process.
+#[cfg(unix)]
 #[allow(unsafe_code)] // libc::kill is a trivially safe-in-practice syscall probe
 fn pid_alive(pid: u32) -> bool {
     // SAFETY: kill(2) with signal 0 only performs permission/existence checks.
@@ -76,6 +75,36 @@ fn pid_alive(pid: u32) -> bool {
         0 => true,
         _ => std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
     }
+}
+
+/// Windows equivalent of the `kill(pid, 0)` probe: query-only open (access
+/// denied still means "someone else's live process", like EPERM), then the
+/// exit-code check — `STILL_ACTIVE` is returned for live processes.
+#[cfg(windows)]
+#[allow(unsafe_code)] // thin process-query FFI, no state mutated
+fn pid_alive(pid: u32) -> bool {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    // SAFETY: query-only handle use; the handle is closed on every path.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process == 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(process, &mut code);
+        CloseHandle(process);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+    fn GetExitCodeProcess(hProcess: isize, lpExitCode: *mut u32) -> i32;
+    fn CloseHandle(hObject: isize) -> i32;
 }
 
 fn main() {
