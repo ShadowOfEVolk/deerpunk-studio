@@ -99,7 +99,10 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+// The crate denies `unsafe_code` (see Cargo.toml); this windows-only FFI
+// probe is the same class of local, deliberate exception as pid_alive above.
 #[cfg(windows)]
+#[allow(unsafe_code)] // kernel32 process-query declarations
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
