@@ -1,0 +1,110 @@
+# Release binaries for the studio (deerpunk-studio) and its MCP sidecar
+# (deerpunk-mcp) on Linux / macOS / Windows.
+#
+# Triggered by a `v*` tag (artifacts are attached to the GitHub Release) or
+# manually via workflow_dispatch (artifacts are downloadable from the run
+# page — the publish job only runs for tags). The engine mirror trick is the
+# same as rust.yml: the engine is checked out as a sibling with its
+# 3rdparty submodules (RmlUi, freetype, lua) and symlinked where the
+# `[patch]` entries in Cargo.toml expect it.
+#
+# Linux binaries link the runner's glibc (ubuntu-latest, currently 24.04) —
+# they need a glibc at least that new, plus the usual GL/X11 runtime libs.
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            art: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            art: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            art: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout engine (sibling, with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: ShadowOfEVolk/deerpunk
+          ref: main
+          path: deerpunk
+          submodules: recursive
+
+      # The [patch] paths are `../deerpunk/...` relative to the workspace —
+      # actions/checkout cannot write outside $GITHUB_WORKSPACE, so link the
+      # sibling there. A junction on Windows needs no privileges; a symlink
+      # on unix is free.
+      - name: Link engine checkout where the [patch] expects it (unix)
+        if: runner.os != 'Windows'
+        run: ln -s "$GITHUB_WORKSPACE/deerpunk" "$GITHUB_WORKSPACE/../deerpunk"
+      - name: Link engine checkout where the [patch] expects it (windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: mklink /J "%GITHUB_WORKSPACE%\..\deerpunk" "%GITHUB_WORKSPACE%\deerpunk"
+
+      - name: Install system dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake clang libclang-dev pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libwayland-dev \
+            libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev
+
+      - name: Build release binaries
+        run: cargo build --release --verbose -p studio-gpui -p deerpunk-mcp
+
+      - name: Stage artifacts (unix)
+        if: runner.os != 'Windows'
+        run: tar czf "deerpunk-studio-${{ matrix.art }}.tar.gz" -C target/release deerpunk-studio deerpunk-mcp
+
+      - name: Stage artifacts (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target\release\deerpunk-studio.exe, target\release\deerpunk-mcp.exe -DestinationPath "deerpunk-studio-${{ matrix.art }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deerpunk-studio-${{ matrix.art }}
+          path: deerpunk-studio-${{ matrix.art }}.*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Attachments carry both binaries: `deerpunk-studio` (the GUI) and
+            `deerpunk-mcp` (the MCP sidecar it spawns).
+
+            - **linux-x64**: glibc ≥ ubuntu-24.04's; needs GL/X11 runtime libs at run time.
+            - **macos-arm64**: unsigned — clear Gatekeeper with `xattr -cr deerpunk-studio` after unpacking.
+            - **windows-x64**: ships the MSVC runtime requirement of the runner toolchain.
